@@ -37,6 +37,7 @@ effectcraft-media = { path = "crates/media" }
 effectcraft-export = { path = "crates/export" }
 effectcraft-expr = { path = "crates/expr" }
 effectcraft-lottie = { path = "crates/lottie" }
+effectcraft-wanim = { path = "crates/wanim" }
 effectcraft-interchange = { path = "crates/interchange" }
 effectcraft-pdf = { path = "crates/pdf" }
 effectcraft-psd = { path = "crates/psd" }
@@ -56,6 +57,10 @@ effectcraft-helper-host = { path = "crates/helper-host" }
 
 # foundation
 thiserror = "2"
+aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc"] }
+hkdf = "0.12"
+sha2 = "0.10"
+getrandom = "0.2"
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }
 log = "0.4"
