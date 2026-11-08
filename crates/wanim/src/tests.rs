@@ -391,3 +391,45 @@ fn layered_frames_over_an_opaque_background_are_not_opaque() {
     let (o, _, _) = export(&p, cid, 1);
     assert_eq!(o.manifest["opaque"], true);
 }
+
+/// A precomp shrunk below half size is drawn from the compositor's box-filtered level; sampled
+/// from the full-size pixels its fine detail would alias and the frames would fall back to
+/// pictures.
+#[test]
+fn layers_shrunk_below_half_size_stay_layered() {
+    use effectcraft_project::build::Ids;
+    use effectcraft_project::{Node, PropGroup};
+    let mut p = Project::default();
+    let pre = p.add_item("Stripes", Label::Sandstone, None, ItemKind::Comp(Comp::new(400, 400, FrameRate::FPS_30, s(1.0)).into()));
+    let pc = p.comp(pre).unwrap().clone();
+    let mut shape = build::layer(&mut p, &pc, "Stripes", LayerSource::Shape, (400, 400), None);
+    let mut next = p.next_id;
+    let groups: Vec<PropGroup> = {
+        let mut ids = Ids(&mut next);
+        (0..40)
+            .map(|i| {
+                let rect = build::shape_rect(&mut ids, [2.0, 380.0], [10.0 * i as f64 + 5.0 - 200.0, 0.0], 0.0);
+                let fill = build::shape_fill(&mut ids, [1.0, 0.9, 0.2, 1.0]);
+                build::shape_group(&mut ids, "Stripe", vec![rect, fill])
+            })
+            .collect()
+    };
+    p.next_id = next;
+    shape.props.sub_mut("contents").unwrap().children.extend(groups.into_iter().map(Node::Group));
+    p.comp_mut(pre).unwrap().layers.push(shape);
+    let main = p.add_item("Main", Label::Sandstone, None, ItemKind::Comp(Comp::new(160, 160, FrameRate::FPS_30, s(1.0)).into()));
+    let mc = p.comp(main).unwrap().clone();
+    let mut layer = build::layer(&mut p, &mc, "Stripes", LayerSource::Comp { item: pre }, (400, 400), None);
+    animate(&mut layer, "scale", Value::Vec3([30.0, 30.0, 100.0]), Value::Vec3([30.0, 30.0, 100.0]));
+    animate(&mut layer, "rotation", Value::Scalar(0.0), Value::Scalar(40.0));
+    p.comp_mut(main).unwrap().layers.push(layer);
+    let (o, report, rendered) = export(&p, main, 2);
+    assert_eq!(report.layered, 30, "{report:?}");
+    let Content::V2 { sprites, .. } = &o.content else { panic!("v2") };
+    assert_eq!(sprites.len(), 1, "the shrunk precomp is stored once");
+    assert!(sprites[0][3] <= 210, "the sprite is the box-filtered level (about 200 pixels), not the 400-pixel precomp");
+    for (f, want) in rendered.iter().enumerate() {
+        let (worst, share) = diff(&compose::frame(&o, f).to_rgba8(), want);
+        assert!(worst <= 40 && share <= 0.002, "frame {f}: worst {worst}, {share}");
+    }
+}

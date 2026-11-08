@@ -164,12 +164,18 @@ fn layer_candidates(r: &Renderer, ctx: &EvalCtx) -> std::result::Result<Vec<Cand
         if !m.is_affine() {
             return Err("perspective");
         }
-        let img = &st.body.img;
+        // A layer shrunk below half size is drawn from a box-filtered level, as the compositor
+        // samples it (players sample bilinear only, so the level goes into the sprite).
+        let level = effectcraft_raster::minified(&st.body.img, m);
+        let (img, m) = match &level {
+            Some((lvl, f)) => (lvl, *m * Mat3::scale(vec2(1.0 / f, 1.0 / f))),
+            None => (&st.body.img, *m),
+        };
         let rgba = img.to_rgba8();
         let Some(rect) = content_rect(img.width, img.height, &rgba) else { continue };
         let bitmap = crop(img.width, &rgba, rect, 1);
         // Sprite pixel (1, 1) is buffer pixel (x0, y0).
-        let m = *m * Mat3::translate(vec2(rect.0 as f64 - 1.0, rect.1 as f64 - 1.0));
+        let m = m * Mat3::translate(vec2(rect.0 as f64 - 1.0, rect.1 as f64 - 1.0));
         out.push(Candidate { bitmap, matrix: to_array(&m), alpha: alpha.min(1.0) });
     }
     Ok(out)
