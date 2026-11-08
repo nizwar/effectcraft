@@ -369,3 +369,25 @@ fn writes_files_for_the_formats_reader() {
         }
     }
 }
+
+/// Players draw an opaque file without blending: a layered frame over an opaque background must
+/// not be marked opaque, or the layers above the background would replace it instead of blending.
+#[test]
+fn layered_frames_over_an_opaque_background_are_not_opaque() {
+    let (p, cid) = comp_with(|p, c| {
+        let mut bar = solid(p, c, [0.1, 0.8, 0.3], 30, 8);
+        animate(&mut bar, "opacity", Value::Scalar(100.0), Value::Scalar(40.0));
+        vec![bar, solid(p, c, [1.0, 1.0, 1.0], 80, 60)]
+    });
+    let (o, report, _) = export(&p, cid, 2);
+    assert_eq!(report.layered, 30);
+    assert_eq!(o.manifest["opaque"], false);
+    // As pictures (a blend mode), the same frames are opaque.
+    let (mut p, cid) = (p, cid);
+    p.comp_mut(cid).unwrap().layers[0].blend_mode = BlendMode::Screen;
+    let (o, report, _) = export(&p, cid, 2);
+    assert_eq!(report.layered, 0);
+    assert_eq!(o.manifest["opaque"], true);
+    let (o, _, _) = export(&p, cid, 1);
+    assert_eq!(o.manifest["opaque"], true);
+}

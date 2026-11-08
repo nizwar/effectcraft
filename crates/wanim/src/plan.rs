@@ -259,6 +259,9 @@ pub fn build(r: &Renderer, comp: ItemId, s: &Settings, progress: &mut dyn FnMut(
         match layered_frame(r, &ctx, size, &rendered, s.tolerance, &mut store) {
             Ok(draws) => {
                 report.layered += 1;
+                // Players draw an opaque file without blending, which only a frame that is a
+                // single opaque picture survives.
+                opaque &= draws.len() == 1 && draws.iter().all(|d| d.alpha >= 1.0);
                 layers.push(draws);
             }
             Err(reason) => {
