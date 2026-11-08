@@ -226,6 +226,13 @@ pub fn write(anim: &Animation, opts: &WriteOptions) -> Result<Written> {
                     if !d.matrix.iter().all(|v| v.is_finite()) || !d.alpha.is_finite() {
                         return Err(Error::Format("a draw has a matrix or opacity that is not a number".into()));
                     }
+                    // A draw that covers no area (singular matrix) or is invisible draws nothing;
+                    // players would divide by zero inverting its matrix.
+                    let [a, b, c, dd, _, _] = d.matrix;
+                    let det = (a * dd - b * c).abs();
+                    if det.is_nan() || det <= 1e-9 || d.alpha < 0.5 / 255.0 {
+                        continue;
+                    }
                     v.push(Draw { sprite, matrix: d.matrix, alpha: d.alpha.clamp(0.0, 1.0) });
                 }
                 out.push(v);

@@ -433,3 +433,35 @@ fn layers_shrunk_below_half_size_stay_layered() {
         assert!(worst <= 40 && share <= 0.002, "frame {f}: worst {worst}, {share}");
     }
 }
+
+/// A draw with a singular matrix (a layer scaled to nothing) or no opacity draws nothing; kept in
+/// the file it made players invert a singular matrix (the reference player turned the whole frame
+/// to NaN, so it showed empty).
+#[test]
+fn draws_that_cover_nothing_are_left_out() {
+    let mut a = v2_animation();
+    if let Frames::Layers(f) = &mut a.frames {
+        f[0].push(Draw { sprite: 1, matrix: [581.0, -8.0, 0.0, 0.0, -500.0, 291.0], alpha: 1.0 });
+        f[0].push(Draw { sprite: 1, matrix: [1.0, 0.0, 0.0, 1.0, 5.0, 5.0], alpha: 0.0007 });
+    }
+    let w = write(&a, &opts(false)).unwrap();
+    let o = open(&w.file, &key_bytes()).unwrap();
+    let Content::V2 { frames, .. } = &o.content else { panic!("v2") };
+    assert_eq!(frames[0].len(), 1);
+
+    // A layer growing from scale 0 never exports a singular draw.
+    let (p, cid) = comp_with(|p, c| {
+        let mut l = solid(p, c, [0.9, 0.5, 0.1], 30, 30);
+        animate(&mut l, "scale", Value::Vec3([0.0, 0.0, 100.0]), Value::Vec3([100.0, 0.0, 100.0]));
+        let mut k = solid(p, c, [0.1, 0.5, 0.9], 20, 20);
+        animate(&mut k, "opacity", Value::Scalar(0.0), Value::Scalar(100.0));
+        vec![l, k]
+    });
+    let (o, report, _) = export(&p, cid, 2);
+    assert_eq!(report.layered, 30, "{report:?}");
+    let Content::V2 { frames, .. } = &o.content else { panic!("v2") };
+    for d in frames.iter().flatten() {
+        let [a, b, c, dd, _, _] = d.matrix;
+        assert!((a * dd - b * c).abs() > 1e-4 && d.alpha > 0.0, "{d:?}");
+    }
+}

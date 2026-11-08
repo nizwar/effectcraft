@@ -152,7 +152,8 @@ fn layer_candidates(r: &Renderer, ctx: &EvalCtx) -> std::result::Result<Vec<Cand
             return Err("collapsed precomp");
         }
         let alpha = r.layer_opacity(ctx, layer);
-        if alpha <= 0.0 {
+        // Below half a level of 8-bit alpha the layer draws nothing a player could show.
+        if alpha < 0.5 / 255.0 {
             continue;
         }
         let Some(st) = r.styled_layer(ctx, layer) else { continue };
@@ -163,6 +164,12 @@ fn layer_candidates(r: &Renderer, ctx: &EvalCtx) -> std::result::Result<Vec<Cand
         let [m] = placement.matrices.as_slice() else { return Err("motion blur") };
         if !m.is_affine() {
             return Err("perspective");
+        }
+        // A layer scaled to (nearly) nothing covers no pixel: a draw with a singular matrix would
+        // only make players divide by zero (the reference player turns the whole frame to NaN).
+        let det = m.determinant().abs();
+        if det.is_nan() || det < 1e-4 {
+            continue;
         }
         // A layer shrunk below half size is drawn from a box-filtered level, as the compositor
         // samples it (players sample bilinear only, so the level goes into the sprite).
