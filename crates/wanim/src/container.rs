@@ -20,7 +20,7 @@ pub const DRAW_BYTES: usize = 32;
 const MAX_MANIFEST: usize = 64 << 20;
 
 /// A 32-byte master key and whether it is the official key (flag bit 0 clear) or a custom one.
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Key {
     bytes: [u8; 32],
     custom: bool,

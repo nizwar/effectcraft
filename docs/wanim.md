@@ -39,7 +39,17 @@ custom one. EffectCraft does not ship the official key. Save it once in the sett
 ```
 
 It is kept as `wanim_official_key.txt` in the [settings folder](preferences.md) and never echoed
-back. To write a file only your own app can open, pass `key` to `file.exportWanim`: the file's
+back.
+
+Or build it into your own binary: compile with the key in `EFFECTCRAFT_WANIM_OFFICIAL_KEY`, and
+exports use it when the settings folder has no key. The key stays out of the source, but anyone
+with that binary has it, so don't hand out such a build.
+
+```sh
+EFFECTCRAFT_WANIM_OFFICIAL_KEY=<64 hexadecimal characters> cargo build --release -p effectcraft -p effectcraft-cli
+```
+
+A custom `key` comes first, then the settings folder's key, then the built-in one. To write a file only your own app can open, pass `key` to `file.exportWanim`: the file's
 header then says it uses a custom key, and the app playing it has to supply that key.
 
 ## Parameters

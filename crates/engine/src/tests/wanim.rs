@@ -16,8 +16,7 @@ fn tmp(name: &str) -> String {
 }
 
 fn session() -> Session {
-    let mut s = Session::default();
-    s.config = Some(Arc::new(MemoryConfig::default()));
+    let mut s = Session { config: Some(Arc::new(MemoryConfig::default())), ..Default::default() };
     s.execute("comp.new", json!({"name": "Badge", "width": 120, "height": 80, "frameRate": 30, "duration": 1})).unwrap();
     s.execute("layer.newSolid", json!({"color": "#ff8000", "width": 40, "height": 30})).unwrap();
     s.execute("prop.addKey", json!({"layer": "#1", "path": "transform/position", "time": 0.0, "value": [20.0, 40.0]})).unwrap();
