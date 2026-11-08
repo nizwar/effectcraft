@@ -344,3 +344,28 @@ fn reads_the_conformance_fixtures() {
         }
     }
 }
+
+/// Writes the moving logo with the official key for the format's own reader to check, when the
+/// key and an output folder are given (`EFFECTCRAFT_WANIM_OFFICIAL_KEY`, `EFFECTCRAFT_WANIM_OUT`).
+/// The key is never part of the repository.
+#[test]
+fn writes_files_for_the_formats_reader() {
+    let (Ok(hex), Ok(out)) = (std::env::var("EFFECTCRAFT_WANIM_OFFICIAL_KEY"), std::env::var("EFFECTCRAFT_WANIM_OUT")) else { return };
+    let (p, cid) = moving_logo();
+    let mut r = Renderer::new(&p, &NoFootage, RenderOpts { backend: Backend::Cpu, ..Default::default() });
+    let cache = LayerCache::default();
+    r.cache = Some(&cache);
+    let c = p.comp(cid).unwrap();
+    for version in [1, 2] {
+        let settings = Settings { version, every_nth: 1, start: Tick(0), end: c.duration, tolerance: Tolerance::default() };
+        let (anim, _) = plan_build(&r, cid, &settings, &mut |_, _| true).unwrap();
+        let w = write(&anim, &WriteOptions { key: Key::official(&hex).unwrap(), atlas_size: 4096, nonces: Nonces::random().unwrap() }).unwrap();
+        std::fs::write(std::path::Path::new(&out).join(format!("logo-v{version}.wanim")), &w.file).unwrap();
+        // The rendered frames, for comparison.
+        for f in [0usize, 15, 29] {
+            let img = r.comp_frame(cid, c.frame_rate.tick_of(f as i64));
+            let png = crate::atlas::encode_png(img.width, img.height, &img.to_rgba8()).unwrap();
+            std::fs::write(std::path::Path::new(&out).join(format!("logo-rendered-{f}.png")), png).unwrap();
+        }
+    }
+}

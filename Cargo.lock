@@ -1605,6 +1605,7 @@ dependencies = [
  "effectcraft-text",
  "effectcraft-time",
  "effectcraft-track",
+ "effectcraft-wanim",
  "exr",
  "image",
  "kurbo",
