@@ -504,6 +504,36 @@ fn transform_form(p: &Value, layer: Option<&effectcraft_engine::project::Layer>,
     (title.into(), fields)
 }
 
+/// File ▸ Export ▸ WANIM…: the file, its version, how frames are described, where the animations
+/// come from and the atlas format.
+fn export_wanim_form(s: &effectcraft_engine::Session) -> (String, Vec<Field>) {
+    let name = s.active_comp_id().and_then(|c| s.project.item(c)).map(|i| i.name.clone()).unwrap_or_else(|| "Animation".into());
+    let dir = s.path.as_deref().and_then(|p| std::path::Path::new(p).parent()).map(|d| d.to_path_buf()).unwrap_or_default();
+    let path = dir.join(format!("{name}.wanim")).to_string_lossy().to_string();
+    (
+        "Export WANIM".into(),
+        vec![
+            Field::save_path("path", "File", &path),
+            Field::choice(
+                "version",
+                "Version",
+                &[("3 – Animations played by key", json!(3)), ("2 – Layers", json!(2)), ("1 – One sprite per frame", json!(1))],
+                0,
+            ),
+            Field::bool("layers", "Frames as layers (version 3)", true),
+            Field::choice(
+                "animations",
+                "Animations (version 3)",
+                &[("One animation: main", Value::Null), ("Comp markers with a duration", json!("markers"))],
+                0,
+            ),
+            Field::note("animationsNote", "A comp marker with a duration is one animation: its comment is the key, or the key and \"loop\" (idle loop)."),
+            Field::choice("atlasFormat", "Atlases (version 3)", &[("PNG", json!("png")), ("WebP (lossless, smaller)", json!("webp"))], 0),
+            Field::bool("workArea", "Work area only", false),
+        ],
+    )
+}
+
 /// If `id` is a dialog command invoked without its parameters, open its form and return true.
 pub fn open_form(app: &mut EffectcraftApp, id: &str, p: &Value) -> bool {
     let s = &app.session;
@@ -770,6 +800,8 @@ pub fn open_form(app: &mut EffectcraftApp, id: &str, p: &Value) -> bool {
             }
             export_timeline_form(s)
         }
+        // File ▸ Export ▸ WANIM…
+        "file.exportWanim" if !has(p, &["path"]) => export_wanim_form(s),
         "file.importPlaceholder" | "file.replaceWithPlaceholder" if p.as_object().is_none_or(|m| m.is_empty()) => (
             "New Placeholder".into(),
             vec![
@@ -1094,6 +1126,27 @@ mod tests {
         assert_eq!(app.dialog_state.form.params()["value"], json!([42.0, 540.0]));
         frame(&mut app, vec![egui::Event::Key { key: egui::Key::Enter, physical_key: None, pressed: true, repeat: false, modifiers: Default::default() }]);
         assert!(app.dialog.is_none(), "one Enter confirms");
+    }
+
+    /// File ▸ Export ▸ WANIM… opens a form: version 3 with layers, one animation and PNG atlases
+    /// unless changed, and the comp markers as the other source of animations.
+    #[test]
+    fn wanim_export_dialog() {
+        let mut app = EffectcraftApp::new(effectcraft_engine::Session::default());
+        let ctx = egui::Context::default();
+        crate::theme::install(&ctx, &app.tokens, crate::i18n::language(&app));
+        app.session.execute("comp.new", json!({"name": "Badge", "width": 64, "height": 36, "frameRate": 25, "duration": 1})).unwrap();
+        crate::menus::invoke(&mut app, &ctx, "file.exportWanim", json!({})).unwrap();
+        assert!(matches!(app.dialog, Some(Dialog::Form)));
+        let f = &app.dialog_state.form;
+        assert_eq!(f.command, "file.exportWanim");
+        assert!(matches!(&f.fields[0].kind, FieldKind::SavePath(p) if p.ends_with("Badge.wanim")));
+        let params = f.params();
+        assert_eq!((&params["version"], &params["layers"], &params["atlasFormat"]), (&json!(3), &json!(true), &json!("png")));
+        assert!(params["animations"].is_null(), "one animation, main");
+        assert!(params.get("animationsNote").is_none());
+        let animations = f.fields.iter().find(|f| f.key == "animations").unwrap();
+        assert!(matches!(&animations.kind, FieldKind::Choice { options, .. } if options[1].1 == json!("markers")));
     }
 
     /// File ▸ Export ▸ Adobe Premiere Pro Project… opens a form that says it writes Final Cut Pro
