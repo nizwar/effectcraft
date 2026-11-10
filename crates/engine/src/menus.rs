@@ -594,6 +594,7 @@ File
     Adobe Premiere Pro Project... | file.exportTimeline
     After Effects Project... | file.exportAep
     Lottie JSON... | file.exportLottie
+    WANIM... | file.exportWanim
     Essential Graphics Template... | essential.exportTemplate
   ---
   Find | app.find

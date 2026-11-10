@@ -51,6 +51,26 @@ fn half(src: &Image) -> Image {
     out
 }
 
+/// The pre-filtered level a warp by `m` samples instead of `src` when it shrinks it below half
+/// size: `src` box-halved until the scale is at least 0.5, and the level's size relative to
+/// `src` (`f`: level pixel `p` covers source pixels `p / f`). `None` when `src` is sampled as
+/// it is. Exporters that redraw a layer elsewhere use it to sample the same pixels.
+pub fn minified(src: &Image, m: &Mat3) -> Option<(Image, f64)> {
+    let scale = m.mean_scale();
+    if !(scale < 0.5 && m.is_affine()) {
+        return None;
+    }
+    let mut s = scale * 2.0;
+    let mut f = 0.5;
+    let mut level_img = half(src);
+    while s < 0.5 && level_img.width > 1 && level_img.height > 1 {
+        level_img = half(&level_img);
+        f *= 0.5;
+        s *= 2.0;
+    }
+    Some((level_img, f))
+}
+
 /// Draw `src` transformed by `m` (src pixel space → dst pixel space) onto `dst` with blending.
 ///
 /// Affine transforms with non-stencil modes take a fast path (per-row span clipping, interior
@@ -321,24 +341,11 @@ fn composite_warp_impl(
     }
     let Some(inv) = m.inverse() else { return NOTHING };
     // Minification: pick a pre-filtered level so sampling doesn't alias.
-    let scale = m.mean_scale();
-    let mut level_img;
-    let mut img = src;
-    let mut inv = inv;
-    if scale < 0.5 && m.is_affine() {
-        let mut s = scale;
-        let mut f = 1.0;
-        level_img = half(src);
-        f *= 0.5;
-        s *= 2.0;
-        while s < 0.5 && level_img.width > 1 && level_img.height > 1 {
-            level_img = half(&level_img);
-            f *= 0.5;
-            s *= 2.0;
-        }
-        img = &level_img;
-        inv = Mat3::scale(vec2(f, f)) * inv;
-    }
+    let level = minified(src, m);
+    let (img, inv) = match &level {
+        Some((level_img, f)) => (level_img, Mat3::scale(vec2(*f, *f)) * inv),
+        None => (src, inv),
+    };
     let bounds = m.map_rect(&Rect::from_size(src.width as f64, src.height as f64)).inflate(1.0).round_out();
     let full = Rect::from_size(dst.width as f64, dst.height as f64);
     let mut area = bounds.intersect(&full);

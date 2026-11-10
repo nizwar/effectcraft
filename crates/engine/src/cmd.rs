@@ -78,6 +78,7 @@ mod view;
 pub mod viewer_cmds;
 pub(crate) mod vpe;
 pub(crate) mod vr_editor;
+mod wanim;
 mod warp_cmds;
 pub(crate) mod watch_folder;
 #[cfg(test)]
@@ -219,6 +220,7 @@ pub fn command_specs() -> &'static [CommandSpec] {
         v.extend(relink::specs());
         v.extend(relink_moved::specs());
         v.extend(lottie::specs());
+        v.extend(wanim::specs());
         v.extend(aep::specs());
         v.extend(import_project::specs());
         v.extend(timeline::specs());

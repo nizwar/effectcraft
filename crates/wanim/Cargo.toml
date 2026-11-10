@@ -1,0 +1,33 @@
+[package]
+name = "effectcraft-wanim"
+description = "Export compositions as .wanim sprite animations (version 1: one sprite per frame; version 2: transformed layer sprites per frame; version 3: several animations by key that share sprites, draws and frames), encrypted with AES-256-GCM"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+effectcraft-time = { workspace = true }
+effectcraft-geom = { workspace = true }
+effectcraft-color = { workspace = true }
+effectcraft-project = { workspace = true }
+effectcraft-raster = { workspace = true }
+effectcraft-render = { workspace = true }
+aes-gcm = { workspace = true }
+hkdf = { workspace = true }
+sha2 = { workspace = true }
+getrandom = { workspace = true }
+image = { workspace = true, features = ["webp"] }
+miniz_oxide = "0.9"
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+# On the web, the salt and nonce come from the browser's crypto.getRandomValues.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { workspace = true, features = ["js"] }
+
+[dev-dependencies]
+effectcraft-keyframe = { workspace = true }
