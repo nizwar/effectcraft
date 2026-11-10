@@ -907,6 +907,25 @@ fn many_small_groups_of_animations_share_atlases() {
 }
 
 #[test]
+fn the_smallest_format_is_chosen_for_each_atlas() {
+    let a = v2_animation();
+    let clips = [clip("in", false, 1), clip("idle", true, 2)];
+    let write = |f| write_animations(&a, &clips, &v3_opts(f)).unwrap();
+    let (png, webp, smallest) = (write(AtlasFormat::Png), write(AtlasFormat::Webp), write(AtlasFormat::Smallest));
+    let (pb, wb, sb) = (blocks(&png.file).1, blocks(&webp.file).1, blocks(&smallest.file).1);
+    let n = smallest.manifest["atlases"].as_array().unwrap().len();
+    assert!(n >= 2);
+    for i in 0..n {
+        // Never larger than either, and labelled as what it is.
+        assert_eq!(sb[i].len(), pb[i].len().min(wb[i].len()));
+        let format = smallest.manifest["atlases"][i]["format"].as_str().unwrap();
+        assert_eq!(format, if &sb[i][..4] == b"RIFF" { "webp" } else { "png" });
+    }
+    let (p, s) = (open(&png.file, &key_bytes()).unwrap(), open(&smallest.file, &key_bytes()).unwrap());
+    assert_eq!(p.atlases, s.atlases);
+}
+
+#[test]
 fn version_3_atlases_can_be_webp() {
     let a = v2_animation();
     let clips = [clip("in", false, 1), clip("idle", true, 2)];

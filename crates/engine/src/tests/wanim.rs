@@ -115,7 +115,7 @@ fn exports_version_3_by_default_with_one_animation() {
     let path = tmp("badge-v3.wanim");
     let r = s.execute_checked("file.exportWanim", json!({"path": path})).unwrap();
     assert_eq!(r["version"], 3);
-    assert_eq!((&r["frames"], &r["layeredFrames"], &r["layers"], &r["atlasFormat"]), (&json!(30), &json!(30), &json!(true), &json!("png")), "{r}");
+    assert_eq!((&r["frames"], &r["layeredFrames"], &r["layers"], &r["atlasFormat"]), (&json!(30), &json!(30), &json!(true), &json!("smallest")), "{r}");
     assert_eq!(r["animations"], json!([{"key": "main", "frameCount": 30, "loop": true, "atlases": [0]}]));
     assert_eq!(r["sprites"], 1, "the moving, fading solid is stored once");
     // The solid holds still from 0.9 s on: frames 27, 28 and 29 are one list.

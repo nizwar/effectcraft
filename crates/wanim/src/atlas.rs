@@ -218,8 +218,11 @@ pub fn pack_sprites(sizes: &[(u32, u32)], page_size: u32) -> Result<(Vec<Page>, 
 pub enum AtlasFormat {
     #[default]
     Png,
-    /// Lossless WebP: the same pixels in fewer bytes (version 3).
+    /// Lossless WebP (version 3). This encoder's WebP is smaller than its PNG for most pictures and
+    /// larger for some.
     Webp,
+    /// Each atlas as PNG or lossless WebP, whichever is fewer bytes (version 3).
+    Smallest,
 }
 
 impl AtlasFormat {
@@ -228,6 +231,7 @@ impl AtlasFormat {
         match self {
             AtlasFormat::Png => "png",
             AtlasFormat::Webp => "webp",
+            AtlasFormat::Smallest => "smallest",
         }
     }
 
@@ -235,21 +239,28 @@ impl AtlasFormat {
         match name {
             "png" => Some(AtlasFormat::Png),
             "webp" => Some(AtlasFormat::Webp),
+            "smallest" => Some(AtlasFormat::Smallest),
             _ => None,
         }
     }
 }
 
-/// Encode straight-alpha RGBA as an atlas in `format`.
-pub fn encode(format: AtlasFormat, width: u32, height: u32, rgba: &[u8]) -> Result<Vec<u8>> {
+/// Encode straight-alpha RGBA as an atlas in `format`, and say which format it is in:
+/// [`AtlasFormat::Smallest`] gives PNG or WebP.
+pub fn encode(format: AtlasFormat, width: u32, height: u32, rgba: &[u8]) -> Result<(AtlasFormat, Vec<u8>)> {
+    let webp = || -> Result<Vec<u8>> {
+        let mut out = vec![];
+        image::codecs::webp::WebPEncoder::new_lossless(&mut out)
+            .encode(rgba, width, height, image::ExtendedColorType::Rgba8)
+            .map_err(|e| Error::Format(format!("WebP encoding failed: {e}")))?;
+        Ok(out)
+    };
     match format {
-        AtlasFormat::Png => encode_png(width, height, rgba),
-        AtlasFormat::Webp => {
-            let mut out = vec![];
-            image::codecs::webp::WebPEncoder::new_lossless(&mut out)
-                .encode(rgba, width, height, image::ExtendedColorType::Rgba8)
-                .map_err(|e| Error::Format(format!("WebP encoding failed: {e}")))?;
-            Ok(out)
+        AtlasFormat::Png => Ok((AtlasFormat::Png, encode_png(width, height, rgba)?)),
+        AtlasFormat::Webp => Ok((AtlasFormat::Webp, webp()?)),
+        AtlasFormat::Smallest => {
+            let (png, webp) = (encode_png(width, height, rgba)?, webp()?);
+            Ok(if webp.len() < png.len() { (AtlasFormat::Webp, webp) } else { (AtlasFormat::Png, png) })
         }
     }
 }
@@ -259,6 +270,7 @@ pub fn decode(format: AtlasFormat, bytes: &[u8]) -> Result<Bitmap> {
     match format {
         AtlasFormat::Png => decode_png(bytes),
         AtlasFormat::Webp => decode_as(bytes, image::ImageFormat::WebP, "WebP"),
+        AtlasFormat::Smallest => Err(Error::Format("an atlas is stored as PNG or WebP".into())),
     }
 }
 

@@ -27,7 +27,7 @@ A version 3 file is smaller than the same frames in version 2, and it can hold s
   before they are encrypted.
 - Sprites touch each other on the atlas (each has its own 1-pixel transparent border), and each
   atlas is as small as its sprites allow.
-- Atlases can be WebP (`atlasFormat`), lossless: the same pixels in fewer bytes.
+- Atlases are PNG or lossless WebP (`atlasFormat`). By default each atlas is stored in whichever of the two is fewer bytes: this encoder's WebP is smaller for most pictures and larger for some.
 
 Frames are described as layers, as in version 2, or with `layers: false` as one picture each, as
 in version 1 (footage-like content where every frame looks different anyway).
@@ -118,7 +118,7 @@ header then says it uses a custom key, and the app playing it has to supply that
 | `version` | 3 | 3, 2 or 1 |
 | `layers` | true | Version 3: describe frames as layers; false stores a picture per frame. Version 2 always has layers, version 1 never |
 | `animations` | one animation, `main` | Version 3: a list of `{key, firstFrame, lastFrame, loop?}`, or `"markers"` (see [Animations](#animations)) |
-| `atlasFormat` | `png` | Version 3: `png` or `webp` (lossless) |
+| `atlasFormat` | `smallest` | Version 3: `smallest` (each atlas as PNG or lossless WebP, whichever is fewer bytes), `png` or `webp` |
 | `scale` | 1 | Output size × scale (above 0, at most 4) |
 | `everyNthFrame` | 1 | Keep every n-th frame; the file's frame rate is divided by n |
 | `workArea` | false | Export the work area instead of the whole comp (not together with `animations`) |
