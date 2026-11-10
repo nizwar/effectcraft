@@ -528,7 +528,12 @@ fn export_wanim_form(s: &effectcraft_engine::Session) -> (String, Vec<Field>) {
                 0,
             ),
             Field::note("animationsNote", "A comp marker with a duration is one animation: its comment is the key, or the key and \"loop\" (idle loop)."),
-            Field::choice("atlasFormat", "Atlases (version 3)", &[("PNG", json!("png")), ("WebP (lossless, smaller)", json!("webp"))], 0),
+            Field::choice(
+                "atlasFormat",
+                "Atlases (version 3)",
+                &[("Smallest of PNG and WebP", json!("smallest")), ("PNG", json!("png")), ("WebP (lossless)", json!("webp"))],
+                0,
+            ),
             Field::bool("workArea", "Work area only", false),
         ],
     )
@@ -1142,7 +1147,7 @@ mod tests {
         assert_eq!(f.command, "file.exportWanim");
         assert!(matches!(&f.fields[0].kind, FieldKind::SavePath(p) if p.ends_with("Badge.wanim")));
         let params = f.params();
-        assert_eq!((&params["version"], &params["layers"], &params["atlasFormat"]), (&json!(3), &json!(true), &json!("png")));
+        assert_eq!((&params["version"], &params["layers"], &params["atlasFormat"]), (&json!(3), &json!(true), &json!("smallest")));
         assert!(params["animations"].is_null(), "one animation, main");
         assert!(params.get("animationsNote").is_none());
         let animations = f.fields.iter().find(|f| f.key == "animations").unwrap();

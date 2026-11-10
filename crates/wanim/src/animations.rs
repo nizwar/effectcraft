@@ -175,7 +175,7 @@ fn groups(pictures: &[Picture]) -> Vec<Vec<usize>> {
 }
 
 /// Copy the pictures into their pages (transparent elsewhere) and encode each page.
-fn render(pages: &[Page], places: &[Place], pictures: &[Picture], border: u32, format: AtlasFormat) -> Result<Vec<Vec<u8>>> {
+fn render(pages: &[Page], places: &[Place], pictures: &[Picture], border: u32, format: AtlasFormat) -> Result<Vec<(AtlasFormat, Vec<u8>)>> {
     let mut pixels: Vec<Vec<u8>> = pages.iter().map(|p| vec![0u8; p.width as usize * p.height as usize * 4]).collect();
     for (place, pic) in places.iter().zip(pictures) {
         let page = pages.get(place.page as usize).ok_or_else(|| Error::Format("sprite on a missing page".into()))?;
@@ -269,7 +269,8 @@ pub fn write_animations(anim: &Animation, clips: &[Clip], opts: &AnimationsOptio
         }
         pages.extend(group_pages);
     }
-    let mut blocks = render(&pages, &places, &pictures, border, opts.atlas_format)?;
+    // Each atlas says its own format: `Smallest` picks per atlas.
+    let (formats, mut blocks): (Vec<AtlasFormat>, Vec<Vec<u8>>) = render(&pages, &places, &pictures, border, opts.atlas_format)?.into_iter().unzip();
     let sprites: Vec<[u32; 5]> = places.iter().zip(&sizes).map(|(p, s)| [p.page, p.x, p.y, s.0, s.1]).collect();
 
     // Every different draw and every different frame once.
@@ -327,7 +328,7 @@ pub fn write_animations(anim: &Animation, clips: &[Clip], opts: &AnimationsOptio
         .collect();
     let n_pages = pages.len();
     let (file, manifest) = container::write_file(ANIMATIONS_VERSION, &opts.key, &opts.nonces, &blocks, |spans| {
-        let atlases: Vec<Value> = pages.iter().zip(spans).map(|(p, s)| container::atlas_entry(*s, p.width, p.height, opts.atlas_format)).collect();
+        let atlases: Vec<Value> = pages.iter().zip(spans).zip(&formats).map(|((p, s), f)| container::atlas_entry(*s, p.width, p.height, *f)).collect();
         let (offset, length) = spans.get(n_pages).copied().unwrap_or((0, 0));
         json!({
             "version": ANIMATIONS_VERSION,

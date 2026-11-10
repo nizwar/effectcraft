@@ -150,9 +150,11 @@ fn export_wanim(s: &mut Session, p: &Value) -> Result<Value> {
         return Err(bad("file.exportWanim", "`scale` must be above 0 and at most 4"));
     }
     let atlas_format = match p.get("atlasFormat").filter(|v| !v.is_null()) {
-        None => AtlasFormat::Png,
-        Some(v) => v.as_str().and_then(AtlasFormat::from_name).ok_or_else(|| bad("file.exportWanim", "`atlasFormat` is \"png\" or \"webp\""))?,
+        None => AtlasFormat::Smallest,
+        Some(v) => v.as_str().and_then(AtlasFormat::from_name).ok_or_else(|| bad("file.exportWanim", "`atlasFormat` is \"smallest\", \"png\" or \"webp\""))?,
     };
+    // A version 1 or 2 file holds PNG atlases, so the smallest format there is PNG.
+    let atlas_format = if version < 3 && atlas_format == AtlasFormat::Smallest { AtlasFormat::Png } else { atlas_format };
     let work_area = b_p(p, "workArea").unwrap_or(false);
     if version < 3 && p.get("animations").is_some_and(|v| !v.is_null()) {
         return Err(bad("file.exportWanim", format!("`animations` needs version 3: a version {version} file holds one animation without a key")));
@@ -239,7 +241,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "WANIM...",
             ["File", "Export"],
             None,
-            "{comp?, path (.wanim), version?: 3 | 2 | 1 (default 3: animations by key; 2: layers; 1: a sprite per frame), layers?: bool (version 3: frames as layers, default true; false: a picture per frame), animations?: [{key, firstFrame, lastFrame, loop?}] | \"markers\" (version 3; default one animation `main`), atlasFormat?: \"png\" | \"webp\" (version 3; default png), scale?: number, everyNthFrame?: int, workArea?: bool, atlasSize?: int (256-4096), key?: 64 hex characters (custom key; default the official key from the settings folder)}",
+            "{comp?, path (.wanim), version?: 3 | 2 | 1 (default 3: animations by key; 2: layers; 1: a sprite per frame), layers?: bool (version 3: frames as layers, default true; false: a picture per frame), animations?: [{key, firstFrame, lastFrame, loop?}] | \"markers\" (version 3; default one animation `main`), atlasFormat?: \"smallest\" | \"png\" | \"webp\" (version 3; default smallest: each atlas as PNG or lossless WebP, whichever is fewer bytes), scale?: number, everyNthFrame?: int, workArea?: bool, atlasSize?: int (256-4096), key?: 64 hex characters (custom key; default the official key from the settings folder)}",
             has_comp,
             export_wanim
         ),
