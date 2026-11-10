@@ -117,7 +117,8 @@ pub fn matrix_of(d: &Draw) -> [f64; 6] {
     d.matrix.map(|v| v as f64)
 }
 
-/// Draw frame `f` of an opened file.
+/// Draw frame `f` of an opened file (version 3: counted over all animations, see
+/// [`crate::AnimationEntry::start`]).
 pub fn frame(file: &Opened, f: usize) -> Canvas {
     let mut canvas = Canvas::new(file.width, file.height);
     match &file.content {
@@ -132,6 +133,16 @@ pub fn frame(file: &Opened, f: usize) -> Canvas {
         }
         Content::V2 { sprites, frames } => {
             for d in frames.get(f).map(Vec::as_slice).unwrap_or(&[]) {
+                if let Some([atlas, x, y, w, h]) = sprites.get(d.sprite as usize).copied()
+                    && let Some(bitmap) = file.atlases.get(atlas as usize)
+                {
+                    draw(&mut canvas, Source { bitmap, rect: [x, y, w, h] }, matrix_of(d), d.alpha);
+                }
+            }
+        }
+        Content::V3 { sprites, scene } => {
+            let list = scene.frames.get(f).and_then(|&l| scene.lists.get(l as usize)).map(Vec::as_slice).unwrap_or(&[]);
+            for d in list.iter().filter_map(|&i| scene.draws.get(i as usize)) {
                 if let Some([atlas, x, y, w, h]) = sprites.get(d.sprite as usize).copied()
                     && let Some(bitmap) = file.atlases.get(atlas as usize)
                 {

@@ -8,6 +8,10 @@
 //! * **Version 2** stores a list of transformed sprites per frame. A layer that only moves,
 //!   turns, scales or fades is stored once and drawn with a matrix and an opacity in every frame;
 //!   a layer whose pixels change gets one sprite per look ([`plan`]).
+//! * **Version 3** holds several animations that are played by key and share their sprites
+//!   ([`animations`]). Frames are described either way (one picture, or layers); every different
+//!   draw and every different frame is stored once, the manifest and the scene are deflated, and
+//!   atlases may be WebP.
 //!
 //! ## File layout
 //!
@@ -16,12 +20,12 @@
 //! | Offset | Size | Field |
 //! |---|---|---|
 //! | 0 | 8 | magic `89 57 41 4E 49 4D 0D 0A` |
-//! | 8 | 2 | `u16` version, 1 or 2 |
+//! | 8 | 2 | `u16` version, 1, 2 or 3 |
 //! | 10 | 2 | `u16` flags: bit 0 = custom key |
 //! | 12 | 4 | `u32` sealed manifest length |
 //! | 16 | 16 | salt |
 //! | 32 | 8 | nonce prefix |
-//! | 40 | … | block 0: the manifest (UTF-8 JSON), then the data section: atlas blocks (PNG), then the version 2 timeline |
+//! | 40 | … | block 0: the manifest (UTF-8 JSON; version 3: raw DEFLATE of it), then the data section: atlas blocks (PNG; version 3: PNG or WebP), then the version 2 timeline or the version 3 scene (raw DEFLATE) |
 //!
 //! The file key is HKDF-SHA256 of the master key with the salt and the info
 //! `wanim/v1/aes-256-gcm`. Block `i` is AES-256-GCM with the nonce `noncePrefix ‖ u32(i)` and
@@ -37,6 +41,7 @@
 
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
+pub mod animations;
 pub mod atlas;
 pub mod compose;
 pub mod container;
@@ -44,7 +49,9 @@ pub mod plan;
 
 use serde_json::{Value, json};
 
-pub use container::{Header, Key, Nonces, read_header};
+pub use animations::{AnimationsOptions, Clip, write_animations};
+pub use atlas::AtlasFormat;
+pub use container::{Header, Key, Nonces, Scene, read_header};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -162,14 +169,20 @@ fn first_use(n: usize, uses: impl Iterator<Item = u32>) -> Result<(Vec<usize>, V
     Ok((order, remap))
 }
 
-/// Pack and encrypt an animation.
-pub fn write(anim: &Animation, opts: &WriteOptions) -> Result<Written> {
+pub(crate) fn check_canvas(anim: &Animation) -> Result<()> {
     if anim.width == 0 || anim.height == 0 {
         return Err(Error::Format("the canvas has no pixels".into()));
     }
     if !anim.fps.is_finite() || anim.fps <= 0.0 {
         return Err(Error::Format("the frame rate must be positive".into()));
     }
+    Ok(())
+}
+
+/// Pack and encrypt an animation as a version 1 ([`Frames::Sprites`]) or version 2
+/// ([`Frames::Layers`]) file. [`write_animations`] writes version 3 from either.
+pub fn write(anim: &Animation, opts: &WriteOptions) -> Result<Written> {
+    check_canvas(anim)?;
     let uses: Vec<u32> = match &anim.frames {
         Frames::Sprites(f) => f.iter().flatten().map(|p| p.bitmap).collect(),
         Frames::Layers(f) => f.iter().flatten().map(|d| d.sprite).collect(),
@@ -247,7 +260,7 @@ pub fn write(anim: &Animation, opts: &WriteOptions) -> Result<Written> {
         let mut m = json!({"version": version});
         if let (Some(m), Some(b)) = (m.as_object_mut(), base.as_object()) {
             m.extend(b.clone());
-            let atlases: Vec<Value> = pages.iter().zip(spans).map(|(p, s)| container::atlas_entry(*s, p.width, p.height)).collect();
+            let atlases: Vec<Value> = pages.iter().zip(spans).map(|(p, s)| container::atlas_entry(*s, p.width, p.height, AtlasFormat::Png)).collect();
             m.insert("atlases".into(), json!(atlases));
             m.insert("sprites".into(), sprites_json);
             if version == 1 {
@@ -265,13 +278,28 @@ pub fn write(anim: &Animation, opts: &WriteOptions) -> Result<Written> {
 
 type Place4 = [u32; 5];
 
-/// What a version 1 or 2 file draws, decoded.
+/// What a file draws, decoded.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Content {
     /// `[atlas, x, y, w, h, dx, dy]` and, per frame, a sprite index or -1.
     V1 { sprites: Vec<[u32; 7]>, frames: Vec<i64> },
     /// `[atlas, x, y, w, h]` and the draws of each frame.
     V2 { sprites: Vec<[u32; 5]>, frames: Vec<Vec<Draw>> },
+    /// `[atlas, x, y, w, h]` and the scene: every different draw, every different frame (a list
+    /// of draws), and the list of each frame, the animations' frames one after the other.
+    V3 { sprites: Vec<[u32; 5]>, scene: Scene },
+}
+
+/// One animation of a version 3 file.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AnimationEntry {
+    pub key: String,
+    /// Its first frame in the file's frames.
+    pub start: usize,
+    pub frame_count: usize,
+    pub looped: bool,
+    /// The atlases its draws use.
+    pub atlases: Vec<u32>,
 }
 
 /// A decrypted, checked file.
@@ -285,6 +313,8 @@ pub struct Opened {
     pub opaque: bool,
     pub atlases: Vec<Bitmap>,
     pub content: Content,
+    /// Version 3: the animations, in the order of their frames. Empty in versions 1 and 2.
+    pub animations: Vec<AnimationEntry>,
 }
 
 impl Opened {
@@ -292,8 +322,46 @@ impl Opened {
         match &self.content {
             Content::V1 { frames, .. } => frames.len(),
             Content::V2 { frames, .. } => frames.len(),
+            Content::V3 { scene, .. } => scene.frames.len(),
         }
     }
+
+    /// The version 3 animation with this key.
+    pub fn animation(&self, key: &str) -> Option<&AnimationEntry> {
+        self.animations.iter().find(|a| a.key == key)
+    }
+}
+
+/// The `animations` of a version 3 manifest, checked: at least one, keys valid and unique, frame
+/// counts at least 1 and adding up to `frame_count`, atlases that exist.
+fn animation_list(m: &Value, frame_count: usize, atlases: usize) -> Result<Vec<AnimationEntry>> {
+    let list = m.get("animations").and_then(Value::as_array).ok_or_else(|| Error::Format("manifest has no animations".into()))?;
+    let mut out: Vec<AnimationEntry> = Vec::with_capacity(list.len().min(1024));
+    let mut start = 0usize;
+    for a in list {
+        let key = a.get("key").and_then(Value::as_str).ok_or_else(|| Error::Format("an animation has no key".into()))?;
+        let bad = || Error::Format(format!("bad animation `{}`", key.chars().take(80).collect::<String>()));
+        animations::check_key(key)?;
+        let frames = u32_field(a, "frameCount").map_err(|_| bad())? as usize;
+        if frames == 0 || out.iter().any(|o| o.key == key) {
+            return Err(bad());
+        }
+        let used = a.get("atlases").and_then(Value::as_array).ok_or_else(bad)?;
+        let used: Vec<u32> =
+            used.iter().map(|v| v.as_u64().and_then(|v| u32::try_from(v).ok()).filter(|&v| (v as usize) < atlases)).collect::<Option<_>>().ok_or_else(bad)?;
+        out.push(AnimationEntry {
+            key: key.into(),
+            start,
+            frame_count: frames,
+            looped: a.get("loop").and_then(Value::as_bool).unwrap_or(false),
+            atlases: used,
+        });
+        start = start.checked_add(frames).ok_or_else(bad)?;
+    }
+    if out.is_empty() || start != frame_count {
+        return Err(Error::Format("the animations do not add up to the frames".into()));
+    }
+    Ok(out)
 }
 
 fn u32_field(m: &Value, k: &str) -> Result<u32> {
@@ -322,6 +390,10 @@ fn sprite_list<const N: usize>(m: &Value, atlases: &[Bitmap]) -> Result<Vec<[u32
         .collect()
 }
 
+fn sprites_len(m: &Value) -> usize {
+    m.get("sprites").and_then(Value::as_array).map_or(0, Vec::len)
+}
+
 /// Decrypt and check a file. `key` is the 32-byte master key (official or custom, as the header
 /// says).
 pub fn open(file: &[u8], key: &[u8; 32]) -> Result<Opened> {
@@ -337,14 +409,32 @@ pub fn open(file: &[u8], key: &[u8; 32]) -> Result<Opened> {
     let mut atlases = Vec::with_capacity(entries.len().min(1024));
     for (i, a) in entries.iter().enumerate() {
         let (offset, length) = (u32_field(a, "offset")? as u64, u32_field(a, "length")? as u64);
-        let png = f.block(file, i as u32 + 1, offset, length)?;
-        let bm = atlas::decode_png(&png)?;
+        let block = f.block(file, i as u32 + 1, offset, length)?;
+        // Only version 3 atlases may be anything but PNG.
+        let format = match a.get("format").and_then(Value::as_str) {
+            Some(name) if f.header.version == container::ANIMATIONS_VERSION => {
+                AtlasFormat::from_name(name).ok_or_else(|| Error::Format(format!("atlas {i} has an unknown format")))?
+            }
+            _ => AtlasFormat::Png,
+        };
+        let bm = atlas::decode(format, &block)?;
         if (bm.width, bm.height) != (u32_field(a, "width")?, u32_field(a, "height")?) {
             return Err(Error::Format(format!("atlas {i} is not the size the manifest says")));
         }
         atlases.push(bm);
     }
-    let content = if f.header.version == 1 {
+    let mut animations = vec![];
+    let content = if f.header.version == container::ANIMATIONS_VERSION {
+        animations = animation_list(m, frame_count, atlases.len())?;
+        let sprites = sprite_list::<5>(m, &atlases)?;
+        let s = m.get("scene").ok_or_else(|| Error::Format("manifest has no scene".into()))?;
+        let (draws, lists, items) = (u32_field(s, "draws")? as usize, u32_field(s, "lists")? as usize, u32_field(s, "items")? as usize);
+        let size = container::scene_size(draws, lists, items, frame_count).ok_or_else(|| Error::Format("scene has the wrong size".into()))?;
+        let sealed = f.block(file, atlases.len() as u32 + 1, u32_field(s, "offset")? as u64, u32_field(s, "length")? as u64)?;
+        // Inflating stops at the size the manifest gives; a stream holding more or less is refused.
+        let bytes = container::inflate(&sealed, size)?;
+        Content::V3 { sprites, scene: container::decode_scene(&bytes, draws, lists, items, frame_count, sprites_len(m))? }
+    } else if f.header.version == 1 {
         let sprites = sprite_list::<7>(m, &atlases)?;
         let frames: Vec<i64> = m
             .get("frames")
@@ -376,6 +466,7 @@ pub fn open(file: &[u8], key: &[u8; 32]) -> Result<Opened> {
         opaque: m.get("opaque").and_then(Value::as_bool).unwrap_or(false),
         atlases,
         content,
+        animations,
     })
 }
 

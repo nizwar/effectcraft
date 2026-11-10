@@ -10,6 +10,9 @@
 //! transformed sprites can't express (3D layers, blend modes other than Normal, track mattes,
 //! adjustment layers, layer styles, motion blur, collapsed precomps), the frame is stored as one
 //! picture instead. A layered file therefore always looks like the rendered composition.
+//!
+//! A version 3 file is planned either way ([`Settings::version`] says how its frames are
+//! described), for one or more named frame ranges of the composition ([`build_animations`]).
 
 use std::collections::{BTreeMap, HashMap};
 use std::hash::{Hash, Hasher};
@@ -20,17 +23,21 @@ use effectcraft_project::{ItemId, Quality};
 use effectcraft_render::{EvalCtx, Renderer, frame_size};
 use effectcraft_time::Tick;
 
+use crate::animations::Clip;
 use crate::compose::{Canvas, Source, draw};
 use crate::{Animation, Bitmap, Draw, Error, Frames, Placed, Result};
 
 /// What to export.
 #[derive(Clone, Debug)]
 pub struct Settings {
-    /// 1 (one sprite per frame) or 2 (layers).
+    /// How frames are described: 1 (one sprite per frame) or 2 (layers). It is also the version
+    /// of the file [`crate::write`] makes of the result; [`crate::write_animations`] writes
+    /// version 3 from either.
     pub version: u16,
     /// Keep every n-th frame (the file's frame rate is divided by it).
     pub every_nth: u32,
-    /// Comp time span, start inclusive, end exclusive.
+    /// Comp time span, start inclusive, end exclusive. Not used when [`build_animations`] is given
+    /// ranges.
     pub start: Tick,
     pub end: Tick,
     /// How far a layered frame may be from the rendered one (see [`Tolerance`]).
@@ -227,63 +234,122 @@ fn layered_frame(r: &Renderer, ctx: &EvalCtx, size: (u32, u32), rendered: &[u8],
     Ok(candidates.into_iter().map(|c| Draw { sprite: store.add(c.bitmap), matrix: f32s(c.matrix), alpha: c.alpha }).collect())
 }
 
-/// Render `comp` at the renderer's scale and describe it for [`crate::write`]. `progress` is
-/// called with (frames done, total) and stops the export by returning `false`.
-pub fn build(r: &Renderer, comp: ItemId, s: &Settings, progress: &mut dyn FnMut(usize, usize) -> bool) -> Result<(Animation, Report)> {
-    let c = r.project.comp(comp).ok_or_else(|| Error::Format("composition not found".into()))?;
+/// A named frame range of the composition: one animation of a version 3 file.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Range {
+    /// 1 to 64 of `A-Z a-z 0-9 _ . -`, unique in the file.
+    pub key: String,
+    pub looped: bool,
+    /// Composition frames, both inclusive (frame 0 starts at comp time 0).
+    pub first: i64,
+    pub last: i64,
+}
+
+/// How one composition frame is stored, kept so that a frame two animations show is planned once.
+#[derive(Clone)]
+struct Planned {
+    sprite: Option<Placed>,
+    draws: Vec<Draw>,
+    empty: bool,
+    opaque: bool,
+    /// Version 2 planning: stored as layers (`Ok`) or as a picture and why.
+    layered: Option<std::result::Result<(), String>>,
+}
+
+fn check_version(s: &Settings) -> Result<()> {
     if s.version != 1 && s.version != 2 {
         return Err(Error::Format(format!("version {} does not exist: use 1 or 2", s.version)));
     }
-    let rate = c.frame_rate;
-    let nth = s.every_nth.max(1) as i64;
-    let (first, end) = (rate.frame_at(s.start), rate.frame_at(s.end.max(s.start)));
-    let total = usize::try_from((end - first).max(0).div_euclid(nth) + i64::from((end - first).max(0) % nth != 0)).unwrap_or(0);
+    Ok(())
+}
+
+fn check_total(total: usize) -> Result<()> {
     if total == 0 {
         return Err(Error::Format("the time span holds no frames".into()));
     }
     if total > 100_000 {
         return Err(Error::TooLarge(format!("{total} frames are more than a .wanim file should hold: export a shorter span or every n-th frame")));
     }
+    Ok(())
+}
+
+/// Render the composition frames `numbers` (in file order; a repeated number is planned once) at
+/// the renderer's scale. `nth` only sets the file's frame rate.
+fn plan_frames(
+    r: &Renderer,
+    comp: ItemId,
+    s: &Settings,
+    numbers: &[i64],
+    nth: i64,
+    progress: &mut dyn FnMut(usize, usize) -> bool,
+) -> Result<(Animation, Report)> {
+    let c = r.project.comp(comp).ok_or_else(|| Error::Format("composition not found".into()))?;
+    let rate = c.frame_rate;
+    let total = numbers.len();
     let size = frame_size(c.width, c.height, r.opts.scale);
     let mut store = Store::default();
     let mut report = Report { frames: total, ..Default::default() };
     let (mut sprites, mut layers) = (vec![], vec![]);
     let mut opaque = true;
-    for i in 0..total {
+    let mut known: HashMap<i64, Planned> = HashMap::new();
+    for (i, &number) in numbers.iter().enumerate() {
         if !progress(i, total) {
             return Err(Error::Cancelled);
         }
-        let t = rate.tick_of(first + i as i64 * nth);
-        let img = r.comp_frame(comp, t);
-        if (img.width, img.height) != size {
-            return Err(Error::Format("the rendered frame has an unexpected size".into()));
-        }
-        let rendered = img.to_rgba8();
-        opaque &= rendered.as_chunks::<4>().0.iter().all(|p| p.get(3) == Some(&255));
-        let rect = content_rect(size.0, size.1, &rendered);
-        if rect.is_none() {
-            report.empty += 1;
+        let planned = match known.get(&number) {
+            Some(p) => p.clone(),
+            None => {
+                let t = rate.tick_of(number);
+                let img = r.comp_frame(comp, t);
+                if (img.width, img.height) != size {
+                    return Err(Error::Format("the rendered frame has an unexpected size".into()));
+                }
+                let rendered = img.to_rgba8();
+                let mut p = Planned {
+                    sprite: None,
+                    draws: vec![],
+                    empty: false,
+                    opaque: rendered.as_chunks::<4>().0.iter().all(|p| p.get(3) == Some(&255)),
+                    layered: None,
+                };
+                let rect = content_rect(size.0, size.1, &rendered);
+                p.empty = rect.is_none();
+                if s.version == 1 {
+                    p.sprite = rect.map(|rc| Placed { bitmap: store.add(crop(size.0, &rendered, rc, 0)), dx: rc.0, dy: rc.1 });
+                } else {
+                    let ctx = r.eval_ctx(comp, t).ok_or_else(|| Error::Format("composition not found".into()))?;
+                    match layered_frame(r, &ctx, size, &rendered, s.tolerance, &mut store) {
+                        Ok(draws) => {
+                            // Players draw an opaque file without blending, which only a frame
+                            // that is a single opaque picture survives.
+                            p.opaque &= draws.len() == 1 && draws.iter().all(|d| d.alpha >= 1.0);
+                            p.draws = draws;
+                            p.layered = Some(Ok(()));
+                        }
+                        Err(reason) => {
+                            p.layered = Some(Err(reason));
+                            p.draws = rect.map_or_else(Vec::new, |rc| {
+                                let m = [1.0, 0.0, 0.0, 1.0, rc.0 as f32 - 1.0, rc.1 as f32 - 1.0];
+                                vec![Draw { sprite: store.add(crop(size.0, &rendered, rc, 1)), matrix: m, alpha: 1.0 }]
+                            });
+                        }
+                    }
+                }
+                known.insert(number, p.clone());
+                p
+            }
+        };
+        opaque &= planned.opaque;
+        report.empty += usize::from(planned.empty);
+        match planned.layered {
+            Some(Ok(())) => report.layered += 1,
+            Some(Err(reason)) => *report.flattened.entry(reason).or_default() += 1,
+            None => {}
         }
         if s.version == 1 {
-            sprites.push(rect.map(|rc| Placed { bitmap: store.add(crop(size.0, &rendered, rc, 0)), dx: rc.0, dy: rc.1 }));
-            continue;
-        }
-        let ctx = r.eval_ctx(comp, t).ok_or_else(|| Error::Format("composition not found".into()))?;
-        match layered_frame(r, &ctx, size, &rendered, s.tolerance, &mut store) {
-            Ok(draws) => {
-                report.layered += 1;
-                // Players draw an opaque file without blending, which only a frame that is a
-                // single opaque picture survives.
-                opaque &= draws.len() == 1 && draws.iter().all(|d| d.alpha >= 1.0);
-                layers.push(draws);
-            }
-            Err(reason) => {
-                *report.flattened.entry(reason).or_default() += 1;
-                layers.push(rect.map_or_else(Vec::new, |rc| {
-                    let m = [1.0, 0.0, 0.0, 1.0, rc.0 as f32 - 1.0, rc.1 as f32 - 1.0];
-                    vec![Draw { sprite: store.add(crop(size.0, &rendered, rc, 1)), matrix: m, alpha: 1.0 }]
-                }));
-            }
+            sprites.push(planned.sprite);
+        } else {
+            layers.push(planned.draws);
         }
     }
     progress(total, total);
@@ -291,4 +357,68 @@ pub fn build(r: &Renderer, comp: ItemId, s: &Settings, progress: &mut dyn FnMut(
     let name = r.project.item(comp).map(|it| it.name.clone());
     let fps = rate.as_f64() / nth as f64;
     Ok((Animation { width: size.0, height: size.1, fps, composition_id: name, opaque, bitmaps: store.bitmaps, frames }, report))
+}
+
+/// The composition frames of the span `s.start..s.end`, every `nth`.
+fn span_frames(r: &Renderer, comp: ItemId, s: &Settings, nth: i64) -> Result<Vec<i64>> {
+    let c = r.project.comp(comp).ok_or_else(|| Error::Format("composition not found".into()))?;
+    let rate = c.frame_rate;
+    let (first, end) = (rate.frame_at(s.start), rate.frame_at(s.end.max(s.start)));
+    let total = usize::try_from((end - first).max(0).div_euclid(nth) + i64::from((end - first).max(0) % nth != 0)).unwrap_or(0);
+    check_total(total)?;
+    Ok((0..total as i64).map(|i| first + i * nth).collect())
+}
+
+/// Render `comp` at the renderer's scale and describe it for [`crate::write`]. `progress` is
+/// called with (frames done, total) and stops the export by returning `false`.
+pub fn build(r: &Renderer, comp: ItemId, s: &Settings, progress: &mut dyn FnMut(usize, usize) -> bool) -> Result<(Animation, Report)> {
+    r.project.comp(comp).ok_or_else(|| Error::Format("composition not found".into()))?;
+    check_version(s)?;
+    let nth = s.every_nth.max(1) as i64;
+    let numbers = span_frames(r, comp, s, nth)?;
+    plan_frames(r, comp, s, &numbers, nth, progress)
+}
+
+/// Render `comp` for [`crate::write_animations`]: one animation per range, in the order given,
+/// each keeping every n-th frame of its range from its first. Without ranges the file has one
+/// animation, `main`, repeating, over the span of the settings. Keys and ranges are checked
+/// before anything is rendered; a frame that two ranges share is rendered once.
+pub fn build_animations(
+    r: &Renderer,
+    comp: ItemId,
+    s: &Settings,
+    ranges: &[Range],
+    progress: &mut dyn FnMut(usize, usize) -> bool,
+) -> Result<(Animation, Vec<Clip>, Report)> {
+    let c = r.project.comp(comp).ok_or_else(|| Error::Format("composition not found".into()))?;
+    check_version(s)?;
+    let nth = s.every_nth.max(1) as i64;
+    if ranges.is_empty() {
+        let numbers = span_frames(r, comp, s, nth)?;
+        let (anim, report) = plan_frames(r, comp, s, &numbers, nth, progress)?;
+        return Ok((anim, vec![Clip::main(numbers.len())], report));
+    }
+    crate::animations::check_keys(ranges.iter().map(|a| a.key.as_str()))?;
+    let comp_frames = c.frame_rate.frame_at(c.duration).max(0);
+    let mut numbers = vec![];
+    let mut clips = Vec::with_capacity(ranges.len().min(1024));
+    for a in ranges {
+        if a.first < 0 || a.last < a.first || a.last >= comp_frames {
+            return Err(Error::Format(format!(
+                "the animation `{}` is frames {} to {}, which is not a range inside the composition (frames 0 to {})",
+                a.key,
+                a.first,
+                a.last,
+                comp_frames - 1
+            )));
+        }
+        let count = usize::try_from((a.last - a.first) / nth + 1).unwrap_or(usize::MAX);
+        if count.saturating_add(numbers.len()) > 100_000 {
+            check_total(count.saturating_add(numbers.len()))?;
+        }
+        numbers.extend((0..count as i64).map(|i| a.first + i * nth));
+        clips.push(Clip { key: a.key.clone(), looped: a.looped, frames: count });
+    }
+    let (anim, report) = plan_frames(r, comp, s, &numbers, nth, progress)?;
+    Ok((anim, clips, report))
 }

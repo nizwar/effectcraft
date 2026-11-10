@@ -465,3 +465,830 @@ fn draws_that_cover_nothing_are_left_out() {
         assert!((a * dd - b * c).abs() > 1e-4 && d.alpha > 0.0, "{d:?}");
     }
 }
+
+// ---- Version 3: animations ----
+
+use crate::container::{OpenedFile, Scene, decode_scene};
+use crate::plan::{Range, build_animations};
+use crate::{AnimationsOptions, AtlasFormat, Clip, Opened, write_animations};
+
+fn v3_opts(format: AtlasFormat) -> AnimationsOptions {
+    AnimationsOptions { key: Key::custom(KEY_HEX).unwrap(), atlas_size: None, atlas_format: format, nonces: Nonces { salt: [7; 16], nonce_prefix: [9; 8] } }
+}
+
+fn clip(key: &str, looped: bool, frames: usize) -> Clip {
+    Clip { key: key.into(), looped, frames }
+}
+
+fn v3(o: &Opened) -> (&Vec<[u32; 5]>, &Scene) {
+    let Content::V3 { sprites, scene } = &o.content else { panic!("v3") };
+    (sprites, scene)
+}
+
+fn write_v3(a: &Animation, clips: &[Clip]) -> Opened {
+    open(&write_animations(a, clips, &v3_opts(AtlasFormat::Png)).unwrap().file, &key_bytes()).unwrap()
+}
+
+/// Every plaintext data block of a version 3 file (atlases, then the deflated scene).
+fn blocks(file: &[u8]) -> (serde_json::Value, Vec<Vec<u8>>) {
+    let f = OpenedFile::open(file, &key_bytes()).unwrap();
+    let m = f.manifest.clone();
+    let span = |v: &serde_json::Value| (v["offset"].as_u64().unwrap(), v["length"].as_u64().unwrap());
+    let mut out = vec![];
+    for (i, a) in m["atlases"].as_array().unwrap().iter().enumerate() {
+        let (o, l) = span(a);
+        out.push(f.block(file, i as u32 + 1, o, l).unwrap());
+    }
+    let (o, l) = span(&m["scene"]);
+    out.push(f.block(file, out.len() as u32 + 1, o, l).unwrap());
+    (m, out)
+}
+
+/// The same file with its manifest changed.
+fn with_manifest(file: &[u8], edit: impl FnOnce(&mut serde_json::Value)) -> Vec<u8> {
+    let (mut m, blocks) = blocks(file);
+    edit(&mut m);
+    crate::container::write_file(3, &Key::custom(KEY_HEX).unwrap(), &v3_opts(AtlasFormat::Png).nonces, &blocks, |_| m).unwrap().0
+}
+
+/// The same file with its scene replaced by `scene` (inflated bytes).
+fn with_scene(file: &[u8], scene: &[u8]) -> Vec<u8> {
+    let (m, mut blocks) = blocks(file);
+    *blocks.last_mut().unwrap() = crate::container::deflate(scene);
+    // The scene is the last block, so only its length changes.
+    let sealed = blocks.last().unwrap().len() as u64 + 16;
+    crate::container::write_file(3, &Key::custom(KEY_HEX).unwrap(), &v3_opts(AtlasFormat::Png).nonces, &blocks, |_| {
+        let mut m = m;
+        m["scene"]["length"] = sealed.into();
+        m
+    })
+    .unwrap()
+    .0
+}
+
+fn inflated_scene(file: &[u8]) -> Vec<u8> {
+    miniz_oxide::inflate::decompress_to_vec(blocks(file).1.last().unwrap()).unwrap()
+}
+
+#[test]
+fn version_3_round_trips() {
+    let a = v2_animation();
+    let w = write_animations(&a, &[clip("transition_in", false, 1), clip("idle", true, 2)], &v3_opts(AtlasFormat::Png)).unwrap();
+    let h = read_header(&w.file).unwrap();
+    assert_eq!((h.version, h.custom_key), (3, true));
+    let o = open(&w.file, &key_bytes()).unwrap();
+    let (sprites, scene) = v3(&o);
+    // The red square is drawn by both animations, the green bar by `idle` only: an atlas each,
+    // so a player that only plays `transition_in` holds one texture. Sprites start at the edge.
+    assert_eq!(sprites, &vec![[0, 0, 0, 14, 14], [1, 0, 0, 22, 8]]);
+    let m = &o.manifest;
+    assert_eq!(m["version"], 3);
+    assert_eq!(m["frameCount"], 3);
+    assert_eq!(m["opaque"], false);
+    assert_eq!(m["gpuBytes"], (14 * 14 + 22 * 8) * 4);
+    assert_eq!(w.gpu_bytes, (14 * 14 + 22 * 8) * 4);
+    assert_eq!(m["atlases"][0]["format"], "png");
+    assert_eq!(
+        m["animations"],
+        serde_json::json!([
+            {"key": "transition_in", "frameCount": 1, "loop": false, "atlases": [0]},
+            {"key": "idle", "frameCount": 2, "loop": true, "atlases": [0, 1]},
+        ])
+    );
+    assert_eq!((m["scene"]["draws"].as_u64(), m["scene"]["lists"].as_u64(), m["scene"]["items"].as_u64()), (Some(3), Some(3), Some(3)));
+    assert_eq!(o.animations.len(), 2);
+    let idle = o.animation("idle").unwrap();
+    assert_eq!((idle.start, idle.frame_count, idle.looped, idle.atlases.clone()), (1, 2, true, vec![0, 1]));
+    let Frames::Layers(frames) = &a.frames else { panic!("layers") };
+    assert_eq!(scene.draws, frames.iter().flatten().copied().collect::<Vec<_>>());
+    assert_eq!(scene.lists, vec![vec![0], vec![1, 2], vec![]]);
+    assert_eq!(scene.frames, vec![0, 1, 2]);
+    // The same pixels as the version 2 file of the same frames.
+    let v2 = open(&write(&a, &opts(false)).unwrap().file, &key_bytes()).unwrap();
+    for f in 0..3 {
+        assert_eq!(compose::frame(&o, f).to_rgba8(), compose::frame(&v2, f).to_rgba8(), "frame {f}");
+    }
+    assert_eq!((w.frame_count, w.sprites, w.atlases, w.draws), (3, 2, 2, 3));
+}
+
+#[test]
+fn version_3_deflates_the_manifest_and_the_scene() {
+    let w = write_animations(&v2_animation(), &[Clip::main(3)], &v3_opts(AtlasFormat::Png)).unwrap();
+    // Block 0 is a raw DEFLATE stream (no zlib header) of the manifest's JSON.
+    let stored = crate::container::stored_manifest(&w.file, &key_bytes()).unwrap();
+    assert!(serde_json::from_slice::<serde_json::Value>(&stored).is_err(), "not plain JSON");
+    let json: serde_json::Value = serde_json::from_slice(&miniz_oxide::inflate::decompress_to_vec(&stored).unwrap()).unwrap();
+    assert_eq!(json, w.manifest);
+    assert_eq!(json["animations"][0], serde_json::json!({"key": "main", "frameCount": 3, "loop": true, "atlases": [0]}));
+    // The scene: one column per draw field, list starts, items, frames.
+    let scene = inflated_scene(&w.file);
+    let (d, l, i, f) = (3, 3, 3, 3);
+    assert_eq!(scene.len(), d * 32 + (l + 1) * 4 + i * 4 + f * 4);
+    let u = |o: usize| u32::from_le_bytes(scene[o..o + 4].try_into().unwrap());
+    let fl = |o: usize| f32::from_le_bytes(scene[o..o + 4].try_into().unwrap());
+    assert_eq!([u(0), u(4), u(8)], [0, 0, 1], "sprite[D]");
+    assert_eq!([fl(12), fl(16), fl(20)], [1.0, 0.866, 1.0], "a[D]");
+    assert_eq!([fl(5 * 12), fl(5 * 12 + 4), fl(5 * 12 + 8)], [3.0, 13.4, 9.0], "tx[D]");
+    assert_eq!([fl(7 * 12), fl(7 * 12 + 4), fl(7 * 12 + 8)], [1.0, 1.0, 0.5], "alpha[D]");
+    assert_eq!((0..4).map(|k| u(96 + k * 4)).collect::<Vec<_>>(), vec![0, 1, 3, 3], "listStart[L + 1]");
+    assert_eq!((0..3).map(|k| u(112 + k * 4)).collect::<Vec<_>>(), vec![0, 1, 2], "items[I]");
+    assert_eq!((0..3).map(|k| u(124 + k * 4)).collect::<Vec<_>>(), vec![0, 1, 2], "frames[F]");
+    // Atlases are not compressed again: block 1 is the PNG itself.
+    assert_eq!(&blocks(&w.file).1[0][..8], b"\x89PNG\r\n\x1a\n");
+}
+
+#[test]
+fn every_different_draw_and_frame_is_stored_once() {
+    let d0 = Draw { sprite: 0, matrix: [1.0, 0.0, 0.0, 1.0, 3.0, 3.0], alpha: 1.0 };
+    // The same draw: -0 is 0.
+    let d0_again = Draw { sprite: 0, matrix: [1.0, -0.0, 0.0, 1.0, 3.0, 3.0], alpha: 1.0 };
+    let d1 = Draw { sprite: 1, matrix: [1.0, 0.0, 0.0, 1.0, 9.0, 33.0], alpha: 0.5 };
+    let mut a = v2_animation();
+    a.frames = Frames::Layers(vec![vec![d0], vec![d0_again, d1], vec![d0], vec![], vec![d1, d0], vec![], vec![d0, d1]]);
+    let o = write_v3(&a, &[clip("a", false, 3), clip("b", true, 4)]);
+    let (_, scene) = v3(&o);
+    assert_eq!(scene.draws, vec![d0, d1]);
+    // The order of draws is part of a frame: [d1, d0] is not [d0, d1].
+    assert_eq!(scene.lists, vec![vec![0], vec![0, 1], vec![], vec![1, 0]]);
+    assert_eq!(scene.frames, vec![0, 1, 0, 2, 3, 2, 1]);
+    let bits = |d: &Draw| (d.sprite, d.matrix.map(f32::to_bits), d.alpha.to_bits());
+    for (i, x) in scene.draws.iter().enumerate() {
+        assert!(scene.draws[..i].iter().all(|y| bits(x) != bits(y)));
+    }
+    for (i, x) in scene.lists.iter().enumerate() {
+        assert!(!scene.lists[..i].contains(x));
+    }
+}
+
+#[test]
+fn a_still_layer_costs_one_draw_and_one_list() {
+    let mut a = v2_animation();
+    let d = Draw { sprite: 0, matrix: [1.0, 0.0, 0.0, 1.0, 3.0, 3.0], alpha: 1.0 };
+    a.frames = Frames::Layers(vec![vec![d]; 30]);
+    let w = write_animations(&a, &[Clip::main(30)], &v3_opts(AtlasFormat::Png)).unwrap();
+    let o = open(&w.file, &key_bytes()).unwrap();
+    let (sprites, scene) = v3(&o);
+    assert_eq!((sprites.len(), scene.draws.len(), scene.lists.len()), (1, 1, 1));
+    assert_eq!(scene.frames, vec![0; 30]);
+    // 32 bytes for the draw, 4 per frame.
+    assert_eq!(inflated_scene(&w.file).len(), 32 + 2 * 4 + 4 + 30 * 4);
+
+    // The same from a composition: a solid that never changes.
+    let (p, cid) = comp_with(|p, c| vec![solid(p, c, [0.2, 0.4, 0.9], 30, 30)]);
+    let r = Renderer::new(&p, &NoFootage, RenderOpts { backend: Backend::Cpu, ..Default::default() });
+    let settings = Settings { version: 2, every_nth: 1, start: Tick(0), end: p.comp(cid).unwrap().duration, tolerance: Tolerance::default() };
+    let (anim, clips, report) = build_animations(&r, cid, &settings, &[], &mut |_, _| true).unwrap();
+    assert_eq!(clips, vec![Clip::main(30)], "without ranges: one animation, `main`, repeating");
+    assert_eq!(report.layered, 30);
+    let o = write_v3(&anim, &clips);
+    let (sprites, scene) = v3(&o);
+    assert_eq!((sprites.len(), scene.draws.len(), scene.lists.len()), (1, 1, 1));
+    assert_eq!(scene.frames, vec![0; 30]);
+}
+
+#[test]
+fn a_picture_two_animations_show_is_stored_once() {
+    let a = Animation {
+        width: 64,
+        height: 48,
+        fps: 12.0,
+        composition_id: None,
+        opaque: false,
+        // Bitmap 2 has the pixels of bitmap 0.
+        bitmaps: vec![
+            bordered(12, 12, [200, 10, 10, 255]),
+            bordered(20, 6, [10, 200, 10, 255]),
+            bordered(12, 12, [200, 10, 10, 255]),
+            bordered(4, 4, [9, 9, 9, 255]),
+        ],
+        frames: Frames::Layers(vec![
+            vec![
+                Draw { sprite: 0, matrix: [1.0, 0.0, 0.0, 1.0, 3.0, 3.0], alpha: 1.0 },
+                Draw { sprite: 1, matrix: [1.0, 0.0, 0.0, 1.0, 9.0, 33.0], alpha: 1.0 },
+            ],
+            vec![Draw { sprite: 2, matrix: [1.0, 0.0, 0.0, 1.0, 3.0, 3.0], alpha: 1.0 }],
+            vec![Draw { sprite: 2, matrix: [1.0, 0.0, 0.0, 1.0, 5.0, 3.0], alpha: 1.0 }],
+        ]),
+    };
+    let o = write_v3(&a, &[clip("in", false, 1), clip("idle", true, 2)]);
+    let (sprites, scene) = v3(&o);
+    assert_eq!(sprites.len(), 2, "the square once, the bar once; the unused bitmap is dropped");
+    assert_eq!(scene.draws.iter().map(|d| d.sprite).collect::<Vec<_>>(), vec![0, 1, 0]);
+    assert_eq!(scene.lists, vec![vec![0, 1], vec![0], vec![2]], "frame 1 is the first draw of frame 0 again");
+    // The square (both animations) and the bar (`in` only) are on an atlas each.
+    assert_eq!(o.atlases.len(), 2);
+    assert_eq!(o.manifest["animations"][0]["atlases"], serde_json::json!([0, 1]));
+    assert_eq!(o.manifest["animations"][1]["atlases"], serde_json::json!([0]));
+    assert_eq!(sprites, &vec![[0, 0, 0, 14, 14], [1, 0, 0, 22, 8]]);
+}
+
+#[test]
+fn version_3_stores_a_picture_per_frame_as_one_draw() {
+    let a = v1_animation();
+    let o = write_v3(&a, &[Clip::main(4)]);
+    let (sprites, scene) = v3(&o);
+    // Each picture gets its 1-pixel border; the draw moves it back by that pixel.
+    assert_eq!(sprites, &vec![[0, 0, 12, 7, 7], [0, 0, 0, 12, 12]]);
+    assert_eq!(
+        scene.draws,
+        vec![Draw { sprite: 0, matrix: [1.0, 0.0, 0.0, 1.0, 3.0, 4.0], alpha: 1.0 }, Draw { sprite: 1, matrix: [1.0, 0.0, 0.0, 1.0, -1.0, -1.0], alpha: 1.0 }]
+    );
+    assert_eq!(scene.lists, vec![vec![0], vec![1], vec![]]);
+    assert_eq!(scene.frames, vec![0, 1, 2, 0]);
+    assert_eq!((o.atlases[0].width, o.atlases[0].height), (12, 19));
+    let v1 = open(&write(&a, &opts(false)).unwrap().file, &key_bytes()).unwrap();
+    for f in 0..4 {
+        assert_eq!(compose::frame(&o, f).to_rgba8(), compose::frame(&v1, f).to_rgba8(), "frame {f}");
+    }
+}
+
+#[test]
+fn version_3_is_opaque_only_when_every_frame_is_one_opaque_picture_over_the_canvas() {
+    let full = |frames: Frames, bitmaps: Vec<Bitmap>| Animation { width: 8, height: 6, fps: 10.0, composition_id: None, opaque: true, bitmaps, frames };
+    let opaque = |a: &Animation| write_v3(a, &[Clip::main(a.frame_count())]).manifest["opaque"].clone();
+    let at = |dx, dy| Some(Placed { bitmap: 0, dx, dy });
+    let pictures = |f: Vec<Option<Placed>>| full(Frames::Sprites(f), vec![square(8, 6, [5, 6, 7, 255])]);
+    assert_eq!(opaque(&pictures(vec![at(0, 0), at(0, 0)])), true);
+    assert_eq!(opaque(&pictures(vec![at(0, 0), None])), false, "an empty frame");
+    assert_eq!(opaque(&pictures(vec![at(1, 0)])), false, "not over the whole canvas");
+    assert_eq!(opaque(&full(Frames::Sprites(vec![at(0, 0)]), vec![square(8, 6, [5, 6, 7, 254])])), false, "not opaque pixels");
+    let layer =
+        |m: [f32; 6], alpha: f32, n: usize| full(Frames::Layers(vec![vec![Draw { sprite: 0, matrix: m, alpha }; n]]), vec![bordered(8, 6, [5, 6, 7, 255])]);
+    assert_eq!(opaque(&layer([1.0, 0.0, 0.0, 1.0, -1.0, -1.0], 1.0, 1)), true);
+    assert_eq!(opaque(&layer([1.0, 0.0, 0.0, 1.0, -1.0, -1.0], 0.5, 1)), false, "faded");
+    assert_eq!(opaque(&layer([2.0, 0.0, 0.0, 2.0, -2.0, -2.0], 1.0, 1)), false, "scaled");
+    assert_eq!(opaque(&layer([1.0, 0.0, 0.0, 1.0, -1.0, -1.0], 1.0, 2)), false, "two draws blend");
+}
+
+#[test]
+fn version_3_leaves_out_draws_that_change_no_pixel() {
+    let mut a = v2_animation();
+    let keep = Draw { sprite: 0, matrix: [1.0, 0.0, 0.0, 1.0, 3.0, 3.0], alpha: 1.0 };
+    a.frames = Frames::Layers(vec![vec![
+        keep,
+        Draw { sprite: 1, matrix: [581.0, -8.0, 0.0, 0.0, -500.0, 291.0], alpha: 1.0 },
+        Draw { sprite: 1, matrix: [1.0, 0.0, 0.0, 1.0, 5.0, 5.0], alpha: 0.0007 },
+        // Right of the 64-pixel canvas, and above it.
+        Draw { sprite: 1, matrix: [1.0, 0.0, 0.0, 1.0, 63.0, 5.0], alpha: 1.0 },
+        Draw { sprite: 1, matrix: [1.0, 0.0, 0.0, 1.0, 5.0, -7.0], alpha: 1.0 },
+        // One pixel column of the bar is still on the canvas.
+        Draw { sprite: 1, matrix: [1.0, 0.0, 0.0, 1.0, 62.0, 5.0], alpha: 1.0 },
+    ]]);
+    let o = write_v3(&a, &[Clip::main(1)]);
+    let (sprites, scene) = v3(&o);
+    assert_eq!(scene.lists, vec![vec![0, 1]]);
+    assert_eq!(scene.draws[1].matrix[4], 62.0);
+    assert_eq!(sprites.len(), 2);
+    // A sprite only such draws use is not stored.
+    if let Frames::Layers(f) = &mut a.frames {
+        f[0].pop();
+    }
+    assert_eq!(v3(&write_v3(&a, &[Clip::main(1)])).0.len(), 1);
+    let mut bad = v2_animation();
+    if let Frames::Layers(f) = &mut bad.frames {
+        f[0][0].matrix[0] = f32::NAN;
+    }
+    assert!(write_animations(&bad, &[Clip::main(3)], &v3_opts(AtlasFormat::Png)).is_err());
+}
+
+#[test]
+fn invalid_keys_and_clips_are_errors() {
+    let a = v2_animation();
+    let write = |clips: &[Clip]| write_animations(&a, clips, &v3_opts(AtlasFormat::Png)).map(|_| ()).map_err(|e| e.to_string());
+    assert!(write(&[clip("transition_in", false, 1), clip("Idle-2.b", true, 2)]).is_ok());
+    assert!(write(&[clip(&"k".repeat(64), true, 3)]).is_ok());
+    for key in ["", " ", "two words", "é", "a/b", "a,b", &"k".repeat(65)] {
+        let e = write(&[clip(key, true, 3)]).unwrap_err();
+        assert!(e.contains("animation key is 1 to 64"), "{key:?}: {e}");
+    }
+    assert!(write(&[clip("a", true, 1), clip("a", true, 2)]).unwrap_err().contains("`a` is used twice"));
+    assert!(write(&[]).unwrap_err().contains("at least one animation"));
+    assert!(write(&[clip("a", true, 3), clip("b", true, 0)]).unwrap_err().contains("`b` has no frames"));
+    assert!(write(&[clip("a", true, 2)]).unwrap_err().contains("take 2 frames, but 3"));
+    assert!(write(&[clip("a", true, 2), clip("b", true, 2)]).unwrap_err().contains("take 4 frames, but 3"));
+    let size = |s| write_animations(&a, &[Clip::main(3)], &AnimationsOptions { atlas_size: Some(s), ..v3_opts(AtlasFormat::Png) });
+    assert!(size(0).is_err() && size(4097).is_err());
+    assert!(matches!(size(16), Err(crate::Error::TooLarge(_))), "the 22-pixel bar does not fit");
+    assert!(size(22).is_ok());
+}
+
+#[test]
+fn invalid_ranges_are_errors_before_anything_is_rendered() {
+    let (p, cid) = moving_logo();
+    let r = Renderer::new(&p, &NoFootage, RenderOpts { backend: Backend::Cpu, ..Default::default() });
+    let settings = |version| Settings { version, every_nth: 1, start: Tick(0), end: s(1.0), tolerance: Tolerance::default() };
+    let range = |key: &str, first, last| Range { key: key.into(), looped: false, first, last };
+    let mut rendered = 0;
+    let mut build = |ranges: &[Range]| {
+        build_animations(&r, cid, &settings(2), ranges, &mut |_, _| {
+            rendered += 1;
+            true
+        })
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+    };
+    // The comp has frames 0 to 29.
+    for (ranges, want) in [
+        (vec![range("in", 0, 30)], "`in` is frames 0 to 30, which is not a range inside the composition (frames 0 to 29)"),
+        (vec![range("in", -1, 5)], "`in` is frames -1 to 5"),
+        (vec![range("in", 9, 8)], "`in` is frames 9 to 8"),
+        (vec![range("in", 0, 3), range("idle", 4, i64::MAX)], "`idle` is frames 4 to"),
+        (vec![range("not a key", 0, 3)], "animation key is 1 to 64"),
+        (vec![range("in", 0, 3), range("in", 4, 5)], "`in` is used twice"),
+    ] {
+        let e = build(&ranges).unwrap_err();
+        assert!(e.contains(want), "{e}");
+    }
+    assert_eq!(rendered, 0);
+    assert!(build_animations(&r, cid, &settings(3), &[], &mut |_, _| true).is_err(), "frames are described as version 1 or 2");
+    assert!(matches!(build_animations(&r, cid, &settings(2), &[range("in", 0, 3)], &mut |_, _| false), Err(crate::Error::Cancelled)));
+}
+
+#[test]
+fn animations_are_frame_ranges_of_the_composition() {
+    let (p, cid) = moving_logo();
+    let cache = LayerCache::default();
+    let mut r = Renderer::new(&p, &NoFootage, RenderOpts { backend: Backend::Cpu, ..Default::default() });
+    r.cache = Some(&cache);
+    let c = p.comp(cid).unwrap();
+    let settings = |version, every_nth| Settings { version, every_nth, start: Tick(0), end: c.duration, tolerance: Tolerance::default() };
+    let ranges = [
+        Range { key: "transition_in".into(), looped: false, first: 0, last: 9 },
+        // Shares frames 8 and 9 with `transition_in`, and ends on the comp's last frame.
+        Range { key: "idle".into(), looped: true, first: 8, last: 29 },
+        Range { key: "still".into(), looped: false, first: 9, last: 9 },
+    ];
+    for version in [1, 2] {
+        let (anim, clips, report) = build_animations(&r, cid, &settings(version, 1), &ranges, &mut |_, _| true).unwrap();
+        assert_eq!(clips, vec![clip("transition_in", false, 10), clip("idle", true, 22), clip("still", false, 1)]);
+        assert_eq!((anim.frame_count(), report.frames), (33, 33));
+        assert_eq!(report.layered, if version == 2 { 33 } else { 0 });
+        let o = write_v3(&anim, &clips);
+        let (sprites, scene) = v3(&o);
+        assert_eq!(o.manifest["frameCount"], 33);
+        // Frames two animations share are the same list.
+        assert_eq!(scene.frames[8..10], scene.frames[10..12]);
+        assert_eq!(scene.frames[32], scene.frames[9]);
+        if version == 2 {
+            assert_eq!(sprites.len(), 2, "two layers, each stored once for all animations");
+            assert_eq!(o.atlases.len(), 1, "every animation draws both");
+        }
+        // Each animation's frames are the comp's.
+        for a in &o.animations {
+            let first = ranges.iter().find(|r| r.key == a.key).unwrap().first;
+            for n in [0, a.frame_count - 1] {
+                let want = r.comp_frame(cid, c.frame_rate.tick_of(first + n as i64)).to_rgba8();
+                let (worst, share) = diff(&compose::frame(&o, a.start + n).to_rgba8(), &want);
+                assert!(worst <= 40 && share <= 0.002, "{} frame {n}: worst {worst}, {share}", a.key);
+            }
+        }
+    }
+    // Every third frame of each range, from its first frame.
+    let (anim, clips, _) = build_animations(&r, cid, &settings(2, 3), &ranges, &mut |_, _| true).unwrap();
+    assert_eq!(clips.iter().map(|c| c.frames).collect::<Vec<_>>(), vec![4, 8, 1], "0 3 6 9, 8 11 … 29, 9");
+    assert_eq!(anim.fps, 10.0);
+}
+
+#[test]
+fn version_3_packs_sprites_edge_to_edge_on_the_smallest_page() {
+    // Sorted by height, on the width that needs the fewest pixels: the bar goes below the square.
+    let (pages, places) = crate::atlas::pack_sprites(&[(14, 14), (22, 8)], 2048).unwrap();
+    assert_eq!(pages, vec![crate::atlas::Page { width: 22, height: 22 }]);
+    assert_eq!(places.iter().map(|p| (p.x, p.y)).collect::<Vec<_>>(), vec![(0, 0), (0, 14)]);
+    // The higher sprites come first whatever the order given: 20 × 34 pixels, not 30 × 30.
+    let (pages, places) = crate::atlas::pack_sprites(&[(10, 4), (10, 30), (10, 30)], 2048).unwrap();
+    assert_eq!(pages, vec![crate::atlas::Page { width: 20, height: 34 }]);
+    assert_eq!(places.iter().map(|p| (p.x, p.y)).collect::<Vec<_>>(), vec![(0, 30), (0, 0), (10, 0)]);
+    // A full page is followed by the next one, in the order given.
+    let (pages, places) = crate::atlas::pack_sprites(&[(60, 60); 5], 128).unwrap();
+    assert_eq!(pages, vec![crate::atlas::Page { width: 120, height: 120 }, crate::atlas::Page { width: 60, height: 60 }]);
+    assert_eq!(places.iter().map(|p| p.page).collect::<Vec<_>>(), vec![0, 0, 0, 0, 1]);
+    assert!(matches!(crate::atlas::pack_sprites(&[(129, 4)], 128), Err(crate::Error::TooLarge(_))));
+    assert!(crate::atlas::pack_sprites(&[(0, 4)], 128).is_err());
+    assert_eq!(crate::atlas::pack_sprites(&[], 128).unwrap().0, vec![]);
+    // No two sprites overlap, and every one is inside its page.
+    let sizes: Vec<(u32, u32)> = (0..200u32).map(|i| (3 + i * 7 % 50, 3 + i * 13 % 40)).collect();
+    let (pages, places) = crate::atlas::pack_sprites(&sizes, 256).unwrap();
+    assert!(pages.len() > 1 && pages.iter().all(|p| p.width <= 256 && p.height <= 256));
+    for (i, (a, sa)) in places.iter().zip(&sizes).enumerate() {
+        assert!(a.x + sa.0 <= pages[a.page as usize].width && a.y + sa.1 <= pages[a.page as usize].height);
+        for (b, sb) in places.iter().zip(&sizes).skip(i + 1) {
+            let apart = a.page != b.page || a.x + sa.0 <= b.x || b.x + sb.0 <= a.x || a.y + sa.1 <= b.y || b.y + sb.1 <= a.y;
+            assert!(apart, "{a:?} {sa:?} and {b:?} {sb:?}");
+        }
+    }
+    assert!(places.windows(2).all(|w| w[0].page <= w[1].page), "pages are filled in the order given");
+}
+
+#[test]
+fn many_small_groups_of_animations_share_atlases() {
+    // Ten animations, each with a picture of its own: more groups than a player should hold
+    // textures for, so the small ones are put together.
+    let bitmaps: Vec<Bitmap> = (0..10u8).map(|i| bordered(4 + i as u32, 4, [i, 9, 9, 255])).collect();
+    let frames = (0..10).map(|i| vec![Draw { sprite: i, matrix: [1.0, 0.0, 0.0, 1.0, 3.0, 3.0], alpha: 1.0 }]).collect();
+    let a = Animation { width: 64, height: 48, fps: 12.0, composition_id: None, opaque: false, bitmaps, frames: Frames::Layers(frames) };
+    let clips: Vec<Clip> = (0..10).map(|i| clip(&format!("a{i}"), false, 1)).collect();
+    let o = write_v3(&a, &clips);
+    assert_eq!(o.atlases.len(), 1);
+    assert_eq!(v3(&o).0.len(), 10);
+    // With eight or fewer, each keeps its own atlas.
+    let a8 = Animation {
+        frames: Frames::Layers(match &a.frames {
+            Frames::Layers(f) => f[..8].to_vec(),
+            Frames::Sprites(_) => panic!("layers"),
+        }),
+        ..a.clone()
+    };
+    let o = write_v3(&a8, &clips[..8]);
+    assert_eq!(o.atlases.len(), 8);
+    for (i, an) in o.animations.iter().enumerate() {
+        assert_eq!(an.atlases, vec![i as u32]);
+    }
+}
+
+#[test]
+fn version_3_atlases_can_be_webp() {
+    let a = v2_animation();
+    let clips = [clip("in", false, 1), clip("idle", true, 2)];
+    let png = write_animations(&a, &clips, &v3_opts(AtlasFormat::Png)).unwrap();
+    let webp = write_animations(&a, &clips, &v3_opts(AtlasFormat::Webp)).unwrap();
+    assert_eq!(webp.manifest["atlases"][0]["format"], "webp");
+    assert_eq!(webp.manifest["atlases"][1]["format"], "webp");
+    assert_eq!(&blocks(&webp.file).1[0][..4], b"RIFF");
+    let (p, w) = (open(&png.file, &key_bytes()).unwrap(), open(&webp.file, &key_bytes()).unwrap());
+    // Lossless: the same pixels.
+    assert_eq!(p.atlases, w.atlases);
+    assert_eq!(p.content, w.content);
+    for f in 0..3 {
+        assert_eq!(compose::frame(&p, f).to_rgba8(), compose::frame(&w, f).to_rgba8());
+    }
+    // Translucent pixels survive too.
+    let mut soft = v1_animation();
+    soft.frames = Frames::Sprites(vec![Some(Placed { bitmap: 1, dx: 4, dy: 5 }), Some(Placed { bitmap: 2, dx: 0, dy: 0 })]);
+    let o = open(&write_animations(&soft, &[Clip::main(2)], &v3_opts(AtlasFormat::Webp)).unwrap().file, &key_bytes()).unwrap();
+    let f0 = compose::frame(&o, 0).to_rgba8();
+    assert_eq!(&f0[((5 * 40 + 4) * 4) as usize..][..4], &[0, 0, 255, 128]);
+    // A file that says PNG but holds WebP is refused, as is an unknown format.
+    assert!(open(&with_manifest(&webp.file, |m| m["atlases"][0]["format"] = "png".into()), &key_bytes()).is_err());
+    assert!(open(&with_manifest(&webp.file, |m| m["atlases"][0]["format"] = "gif".into()), &key_bytes()).is_err());
+}
+
+/// The spec's "Reject ..." rules for a version 3 manifest.
+#[test]
+fn a_bad_version_3_manifest_is_rejected() {
+    let w = write_animations(&v2_animation(), &[clip("in", false, 1), clip("idle", true, 2)], &v3_opts(AtlasFormat::Png)).unwrap();
+    assert!(open(&with_manifest(&w.file, |_| {}), &key_bytes()).is_ok(), "rewritten unchanged, it opens");
+    let cases: Vec<(&str, Box<dyn Fn(&mut serde_json::Value)>)> = vec![
+        ("version is not 3", Box::new(|m| m["version"] = 2.into())),
+        ("keys are not unique", Box::new(|m| m["animations"][1]["key"] = "in".into())),
+        ("a key does not match the pattern", Box::new(|m| m["animations"][1]["key"] = "id le".into())),
+        ("a key is empty", Box::new(|m| m["animations"][1]["key"] = "".into())),
+        ("a key is too long", Box::new(|m| m["animations"][1]["key"] = "k".repeat(65).into())),
+        ("a key is not text", Box::new(|m| m["animations"][1]["key"] = 5.into())),
+        ("a frame count is 0", Box::new(|m| m["animations"][0]["frameCount"] = 0.into())),
+        ("a frame count is not a whole number", Box::new(|m| m["animations"][0]["frameCount"] = 1.5.into())),
+        ("frame counts add up to less", Box::new(|m| m["animations"][1]["frameCount"] = 1.into())),
+        ("frame counts add up to more", Box::new(|m| m["animations"][1]["frameCount"] = 3.into())),
+        ("frameCount is another", Box::new(|m| m["frameCount"] = 4.into())),
+        ("an animation names a missing atlas", Box::new(|m| m["animations"][0]["atlases"] = serde_json::json!([0, 2]))),
+        ("atlases is not a list", Box::new(|m| m["animations"][0]["atlases"] = 0.into())),
+        ("no animations", Box::new(|m| m["animations"] = serde_json::json!([]))),
+        (
+            "animations is missing",
+            Box::new(|m| {
+                m.as_object_mut().unwrap().remove("animations");
+            }),
+        ),
+        (
+            "the scene is missing",
+            Box::new(|m| {
+                m.as_object_mut().unwrap().remove("scene");
+            }),
+        ),
+        ("the scene holds fewer draws than said", Box::new(|m| m["scene"]["draws"] = 4.into())),
+        ("the scene holds more lists than said", Box::new(|m| m["scene"]["lists"] = 2.into())),
+        ("the scene holds more items than said", Box::new(|m| m["scene"]["items"] = 2.into())),
+        ("a sprite reaches outside its atlas", Box::new(|m| m["sprites"][0][3] = 15.into())),
+        (
+            "a draw's sprite is missing",
+            Box::new(|m| {
+                m["sprites"].as_array_mut().unwrap().pop();
+            }),
+        ),
+    ];
+    for (what, edit) in cases {
+        assert!(open(&with_manifest(&w.file, edit), &key_bytes()).is_err(), "{what}");
+    }
+    // Unknown fields are ignored.
+    assert!(open(&with_manifest(&w.file, |m| m["animations"][0]["later"] = true.into()), &key_bytes()).is_ok());
+}
+
+/// The spec's "Reject ..." rules for a scene.
+#[test]
+fn a_bad_scene_is_rejected() {
+    let w = write_animations(&v2_animation(), &[clip("in", false, 1), clip("idle", true, 2)], &v3_opts(AtlasFormat::Png)).unwrap();
+    let good = inflated_scene(&w.file);
+    // D = 3, L = 3, I = 3, F = 3: listStart at 96, items at 112, frames at 124.
+    assert_eq!(good.len(), 136);
+    assert!(decode_scene(&good, 3, 3, 3, 3, 2).is_ok());
+    assert!(open(&with_scene(&w.file, &good), &key_bytes()).is_ok(), "rewritten unchanged, it opens");
+    let put = |at: usize, v: u32| {
+        let mut s = good.clone();
+        s[at..at + 4].copy_from_slice(&v.to_le_bytes());
+        s
+    };
+    for (what, scene) in [
+        ("a sprite index is not below sprites.length", put(8, 2)),
+        ("listStart[0] is not 0", put(96, 1)),
+        ("listStart decreases", put(100, 4)),
+        ("listStart decreases at the end", put(104, 4)),
+        ("listStart[L] is not I", put(108, 2)),
+        ("listStart[L] is above I", put(108, 4)),
+        ("an item is not below D", put(116, 3)),
+        ("a frame is not below L", put(132, 3)),
+        ("the stream holds less", good[..132].to_vec()),
+        ("the stream holds more", [good.clone(), vec![0; 4]].concat()),
+        ("the stream is empty", vec![]),
+    ] {
+        assert!(decode_scene(&scene, 3, 3, 3, 3, 2).is_err(), "{what}");
+        assert!(open(&with_scene(&w.file, &scene), &key_bytes()).is_err(), "{what}, in a file");
+    }
+    // A scene that is not a DEFLATE stream.
+    let (m, mut b) = blocks(&w.file);
+    *b.last_mut().unwrap() = good.clone();
+    let stored = crate::container::write_file(3, &Key::custom(KEY_HEX).unwrap(), &v3_opts(AtlasFormat::Png).nonces, &b, |spans| {
+        let mut m = m;
+        m["scene"]["length"] = spans.last().unwrap().1.into();
+        m
+    })
+    .unwrap()
+    .0;
+    assert!(open(&stored, &key_bytes()).is_err());
+    // Sizes that overflow are refused, not computed.
+    assert!(decode_scene(&good, usize::MAX / 8, 3, 3, 3, 2).is_err());
+    assert!(decode_scene(&good, 3, usize::MAX, usize::MAX, usize::MAX, 2).is_err());
+}
+
+#[test]
+fn damaged_version_3_files_never_panic() {
+    let w = write_animations(&v2_animation(), &[clip("in", false, 1), clip("idle", true, 2)], &v3_opts(AtlasFormat::Png)).unwrap();
+    for n in 0..w.file.len() {
+        assert!(open(&w.file[..n], &key_bytes()).is_err(), "cut at {n}");
+    }
+    for i in [9, 20, 45, w.file.len() - 1] {
+        let mut f = w.file.clone();
+        f[i] ^= 1;
+        assert!(open(&f, &key_bytes()).is_err(), "byte {i}");
+    }
+    assert!(open(&w.file, &[1; 32]).is_err());
+    // A manifest that is not deflated, and one that inflates to something else than JSON.
+    let (m, b) = blocks(&w.file);
+    let as_v2 = crate::container::write_file(2, &Key::custom(KEY_HEX).unwrap(), &v3_opts(AtlasFormat::Png).nonces, &b, |_| m).unwrap().0;
+    let mut plain = as_v2.clone();
+    plain[8] = 3;
+    assert!(open(&plain, &key_bytes()).is_err());
+    assert!(
+        read_header(&{
+            let mut f = w.file.clone();
+            f[8] = 4;
+            f
+        })
+        .is_err()
+    );
+}
+
+/// The files version 1 and 2 exports wrote before version 3 existed, byte for byte: with the
+/// salt and nonce fixed, everything but the PNG encoder's own choices is pinned here (the
+/// manifest's text, the sealed sizes, the timeline's bytes).
+#[test]
+fn versions_1_and_2_are_written_as_before() {
+    let w = write(&v1_animation(), &opts(false)).unwrap();
+    let plain = crate::container::stored_manifest(&w.file, &key_bytes()).unwrap();
+    assert_eq!(w.file[..16], [0x89, 0x57, 0x41, 0x4E, 0x49, 0x4D, 0x0D, 0x0A, 1, 0, 0, 0, (plain.len() + 16) as u8, ((plain.len() + 16) >> 8) as u8, 0, 0]);
+    let length = w.manifest["atlases"][0]["length"].as_u64().unwrap();
+    assert_eq!(
+        String::from_utf8(plain.clone()).unwrap(),
+        format!(
+            r#"{{"atlases":[{{"format":"png","height":14,"length":{length},"offset":0,"width":21}}],"compositionId":"ball","fps":30.0,"frameCount":4,"frames":[0,1,-1,0],"gpuBytes":1176,"height":30,"opaque":false,"sprites":[[0,2,2,5,5,4,5],[0,9,2,10,10,0,0]],"version":1,"width":40}}"#
+        )
+    );
+    assert_eq!(w.file.len() as u64, 40 + plain.len() as u64 + 16 + length);
+
+    let w = write(&v2_animation(), &opts(true)).unwrap();
+    let plain = crate::container::stored_manifest(&w.file, &key_bytes()).unwrap();
+    assert_eq!(w.file[8..12], [2, 0, 1, 0]);
+    let length = w.manifest["atlases"][0]["length"].as_u64().unwrap();
+    assert_eq!(
+        String::from_utf8(plain.clone()).unwrap(),
+        format!(
+            r#"{{"atlases":[{{"format":"png","height":18,"length":{length},"offset":0,"width":42}}],"compositionId":null,"fps":12.0,"frameCount":3,"gpuBytes":3024,"height":48,"opaque":false,"sprites":[[0,2,2,14,14],[0,18,2,22,8]],"timeline":{{"draws":3,"length":128,"offset":{length}}},"version":2,"width":64}}"#
+        )
+    );
+    let f = OpenedFile::open(&w.file, &key_bytes()).unwrap();
+    let timeline = f.block(&w.file, 2, length, 128).unwrap();
+    assert_eq!(timeline.len(), 4 * 4 + 3 * 32);
+    assert_eq!(timeline[..16], [0, 0, 0, 0, 1, 0, 0, 0, 3, 0, 0, 0, 3, 0, 0, 0]);
+    let Frames::Layers(frames) = v2_animation().frames else { panic!("layers") };
+    let mut draws = vec![];
+    for d in frames.iter().flatten() {
+        draws.extend(d.sprite.to_le_bytes());
+        draws.extend(d.matrix.iter().flat_map(|v| v.to_le_bytes()));
+        draws.extend(d.alpha.to_le_bytes());
+    }
+    assert_eq!(timeline[16..], draws, "32 bytes per draw, in frame order");
+    assert_eq!(w.file.len() as u64, 40 + plain.len() as u64 + 16 + length + 128);
+}
+
+/// The format's version 3 fixtures, when a local copy is available (`EFFECTCRAFT_WANIM_FIXTURES`):
+/// the reader reproduces the expected manifest, atlases, scene and frames, and the writer, given
+/// the animations the fixture was packed from, writes the same sprites, scene and atlas pixels.
+#[test]
+fn reads_and_reproduces_the_version_3_fixtures() {
+    let Ok(dir) = std::env::var("EFFECTCRAFT_WANIM_FIXTURES") else { return };
+    let dir = std::path::Path::new(&dir);
+    let exp: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("expected-animations.json")).unwrap()).unwrap();
+    let key = crate::container::parse_hex_key(exp["customKey"].as_str().unwrap()).unwrap();
+    let bytes = std::fs::read(dir.join("sample-animations-custom-key.wanim")).unwrap();
+    let o = open(&bytes, &key).unwrap();
+    assert_eq!(o.manifest, exp["manifest"]);
+    let f = OpenedFile::open(&bytes, &key).unwrap();
+    for (i, a) in exp["manifest"]["atlases"].as_array().unwrap().iter().enumerate() {
+        let png = f.block(&bytes, i as u32 + 1, a["offset"].as_u64().unwrap(), a["length"].as_u64().unwrap()).unwrap();
+        assert_eq!(format!("{:x}", sha2::Sha256::digest(&png)), exp["atlasSha256"][i].as_str().unwrap(), "atlas {i}");
+    }
+    let same_scene = |o: &Opened, what: &str| {
+        let (_, scene) = v3(o);
+        let want = exp["scene"]["draws"].as_array().unwrap();
+        assert_eq!(scene.draws.len(), want.len(), "{what}");
+        for (d, w) in scene.draws.iter().zip(want) {
+            assert_eq!(d.sprite as u64, w["sprite"].as_u64().unwrap(), "{what}");
+            for (a, b) in d.matrix.iter().zip(w["matrix"].as_array().unwrap()) {
+                assert_eq!(*a as f64, b.as_f64().unwrap(), "{what}");
+            }
+            assert_eq!(d.alpha as f64, w["alpha"].as_f64().unwrap(), "{what}");
+        }
+        assert_eq!(serde_json::json!(scene.lists), exp["scene"]["lists"], "{what}");
+        for a in &o.animations {
+            assert_eq!(serde_json::json!(scene.frames[a.start..a.start + a.frame_count]), exp["scene"]["frames"][&a.key], "{what} {}", a.key);
+        }
+    };
+    same_scene(&o, "fixture");
+    // Atlas pixels as the fixture hashes them: straight alpha, invisible pixels set to 0.
+    let pixels = |o: &Opened, i: usize| {
+        let mut px = o.atlases[i].rgba.clone();
+        for p in px.as_chunks_mut::<4>().0 {
+            if p[3] == 0 {
+                *p = [0; 4];
+            }
+        }
+        format!("{:x}", sha2::Sha256::digest(&px))
+    };
+    let same_frames = |o: &Opened, what: &str| {
+        for a in &o.animations {
+            for n in 0..a.frame_count {
+                let png = std::fs::read(dir.join(format!("animations-{}-{n}.png", a.key))).unwrap();
+                let want = crate::atlas::decode_png(&png).unwrap();
+                let (worst, _) = diff(&compose::frame(o, a.start + n).to_rgba8(), &want.rgba);
+                assert!(worst <= 1, "{what} {} frame {n}: worst {worst}", a.key);
+            }
+        }
+    };
+    same_frames(&o, "fixture");
+    for i in 0..o.atlases.len() {
+        assert_eq!(pixels(&o, i), exp["atlasPixelsSha256"][i].as_str().unwrap(), "atlas {i}");
+    }
+
+    // The animations the fixture was packed from, written here.
+    let turn = |degrees: f64, x: f64, y: f64, size: f64| {
+        let (s, c) = (degrees * std::f64::consts::PI / 180.0).sin_cos();
+        [c, s, -s, c, x - (c * size - s * size) / 2.0, y - (s * size + c * size) / 2.0]
+    };
+    let at = |x: f64, y: f64| [1.0, 0.0, 0.0, 1.0, x, y];
+    // The fixture's matrices place the picture; here they place the sprite, border included.
+    let d = |bitmap: u32, m: [f64; 6], alpha: f32| {
+        let [a, b, c, dd, tx, ty] = m;
+        Draw { sprite: bitmap, matrix: [a, b, c, dd, -a - c + tx, -b - dd + ty].map(|v| v as f32), alpha }
+    };
+    let paint = |w: u32, h: u32, f: &dyn Fn(u32, u32) -> [u8; 4]| {
+        let mut b = square(w + 2, h + 2, [0; 4]);
+        for y in 0..h {
+            for x in 0..w {
+                let i = (((y + 1) * (w + 2) + x + 1) * 4) as usize;
+                b.rgba[i..i + 4].copy_from_slice(&f(x, y));
+            }
+        }
+        b
+    };
+    let star = |x: u32, y: u32| if x.abs_diff(2) + y.abs_diff(2) <= 2 { [255, 230, 80, 255] } else { [0; 4] };
+    let (badge, bar) = (d(0, at(26.0, 18.0), 1.0), d(1, at(22.0, 36.0), 1.0));
+    let anim = Animation {
+        width: 64,
+        height: 48,
+        fps: 12.0,
+        composition_id: Some("sample-animations".into()),
+        opaque: false,
+        bitmaps: vec![
+            paint(12, 12, &|x, y| [255, (x * 20) as u8, (y * 20) as u8, 255]),
+            paint(20, 6, &|_, _| [40, 120, 255, 160]),
+            paint(5, 5, &star),
+            paint(5, 5, &star),
+        ],
+        frames: Frames::Layers(vec![
+            vec![],
+            vec![d(0, turn(60.0, 8.0, 24.0, 12.0), 0.5)],
+            vec![d(0, turn(30.0, 20.0, 24.0, 12.0), 0.75), d(1, [0.5, 0.0, 0.0, 1.0, 27.0, 36.0], 0.5)],
+            vec![badge, bar],
+            vec![badge, bar],
+            vec![badge, bar, d(2, at(44.0, 8.0), 1.0)],
+            vec![badge, bar, d(2, at(44.0, 8.0), 1.0)],
+            vec![badge, bar, d(3, [2.0, 0.0, 0.0, 2.0, 40.0, 4.0], 0.5), d(3, at(12.0, 8.0), 1.0)],
+            vec![badge, bar],
+            vec![d(0, at(26.0, 18.0), 0.5), d(1, [1.5, 0.0, 0.0, 1.0, 17.0, 36.0], 0.5)],
+            vec![d(0, [-1.0, 0.0, 0.0, 1.0, 70.0, 40.0], 0.25)],
+        ]),
+    };
+    let clips = [clip("transition_in", false, 4), clip("idle", true, 4), clip("transition_out", false, 3)];
+    for format in [AtlasFormat::Png, AtlasFormat::Webp] {
+        let w =
+            write_animations(&anim, &clips, &AnimationsOptions { key: Key::custom(exp["customKey"].as_str().unwrap()).unwrap(), ..v3_opts(format) }).unwrap();
+        let mine = open(&w.file, &key).unwrap();
+        let want = &exp["manifest"];
+        for k in ["version", "compositionId", "width", "height", "frameCount", "opaque", "gpuBytes", "sprites", "animations"] {
+            assert_eq!(mine.manifest[k], want[k], "{k}");
+        }
+        assert_eq!(mine.manifest["fps"].as_f64(), want["fps"].as_f64());
+        for k in ["draws", "lists", "items"] {
+            assert_eq!(mine.manifest["scene"][k], want["scene"][k], "scene.{k}");
+        }
+        for (i, a) in want["atlases"].as_array().unwrap().iter().enumerate() {
+            assert_eq!((&mine.manifest["atlases"][i]["width"], &mine.manifest["atlases"][i]["height"]), (&a["width"], &a["height"]), "atlas {i}");
+            assert_eq!(mine.manifest["atlases"][i]["format"], format.name());
+            assert_eq!(pixels(&mine, i), exp["atlasPixelsSha256"][i].as_str().unwrap(), "atlas {i} pixels, {format:?}");
+        }
+        same_scene(&mine, "written here");
+        same_frames(&mine, "written here");
+    }
+
+    // The fixtures with the official key, when it is given.
+    let Ok(hex) = std::env::var("EFFECTCRAFT_WANIM_OFFICIAL_KEY") else { return };
+    let official = crate::container::parse_hex_key(&hex).unwrap();
+    let o = open(&std::fs::read(dir.join("sample-animations.wanim")).unwrap(), &official).unwrap();
+    assert_eq!(o.manifest, exp["manifest"]);
+    let o = open(&std::fs::read(dir.join("sample-animations-webp.wanim")).unwrap(), &official).unwrap();
+    assert_eq!(o.manifest, exp["webp"]["manifest"]);
+    same_scene(&o, "WebP fixture");
+    same_frames(&o, "WebP fixture");
+    for i in 0..o.atlases.len() {
+        assert_eq!(pixels(&o, i), exp["webp"]["atlasPixelsSha256"][i].as_str().unwrap(), "WebP atlas {i}");
+    }
+}
+
+/// Writes the moving logo as version 3 files for the format's own reader to check, with what was
+/// written beside them as JSON, when the key and an output folder are given
+/// (`EFFECTCRAFT_WANIM_OFFICIAL_KEY`, `EFFECTCRAFT_WANIM_OUT`). The key is never part of the
+/// repository.
+#[test]
+fn writes_version_3_files_for_the_formats_reader() {
+    let (Ok(hex), Ok(out)) = (std::env::var("EFFECTCRAFT_WANIM_OFFICIAL_KEY"), std::env::var("EFFECTCRAFT_WANIM_OUT")) else { return };
+    let out = std::path::Path::new(&out);
+    let official = crate::container::parse_hex_key(&hex).unwrap();
+    let (p, cid) = moving_logo();
+    let mut r = Renderer::new(&p, &NoFootage, RenderOpts { backend: Backend::Cpu, ..Default::default() });
+    let cache = LayerCache::default();
+    r.cache = Some(&cache);
+    let c = p.comp(cid).unwrap();
+    let ranges = [
+        Range { key: "transition_in".into(), looped: false, first: 0, last: 9 },
+        Range { key: "idle".into(), looped: true, first: 10, last: 19 },
+        Range { key: "transition_out".into(), looped: false, first: 15, last: 29 },
+    ];
+    for (name, version, ranges, format) in [
+        ("logo-v3", 2, &ranges[..], AtlasFormat::Png),
+        ("logo-v3-webp", 2, &ranges[..], AtlasFormat::Webp),
+        ("logo-v3-pictures", 1, &ranges[..], AtlasFormat::Png),
+        ("logo-v3-main", 2, &[][..], AtlasFormat::Png),
+    ] {
+        let settings = Settings { version, every_nth: 1, start: Tick(0), end: c.duration, tolerance: Tolerance::default() };
+        let (anim, clips, _) = build_animations(&r, cid, &settings, ranges, &mut |_, _| true).unwrap();
+        let opts = AnimationsOptions { key: Key::official(&hex).unwrap(), atlas_size: None, atlas_format: format, nonces: Nonces::random().unwrap() };
+        let w = write_animations(&anim, &clips, &opts).unwrap();
+        std::fs::write(out.join(format!("{name}.wanim")), &w.file).unwrap();
+        let o = open(&w.file, &official).unwrap();
+        let (_, scene) = v3(&o);
+        let f = OpenedFile::open(&w.file, &official).unwrap();
+        let atlas_sha: Vec<String> = w.manifest["atlases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .enumerate()
+            .map(|(i, a)| {
+                format!("{:x}", sha2::Sha256::digest(f.block(&w.file, i as u32 + 1, a["offset"].as_u64().unwrap(), a["length"].as_u64().unwrap()).unwrap()))
+            })
+            .collect();
+        let draws: Vec<serde_json::Value> = scene.draws.iter().map(|d| serde_json::json!({"sprite": d.sprite, "matrix": d.matrix, "alpha": d.alpha})).collect();
+        let frames: serde_json::Map<String, serde_json::Value> =
+            o.animations.iter().map(|a| (a.key.clone(), serde_json::json!(scene.frames[a.start..a.start + a.frame_count]))).collect();
+        let written = serde_json::json!({"manifest": w.manifest, "atlasSha256": atlas_sha, "scene": {"draws": draws, "lists": scene.lists, "frames": frames}});
+        std::fs::write(out.join(format!("{name}.json")), serde_json::to_vec_pretty(&written).unwrap()).unwrap();
+    }
+}

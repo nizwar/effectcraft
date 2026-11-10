@@ -1,5 +1,5 @@
-//! The `.wanim` container: header, key derivation, encrypted blocks, manifest and the version 2
-//! timeline (see the crate docs for the layout).
+//! The `.wanim` container: header, key derivation, encrypted blocks, manifest, the version 2
+//! timeline and the version 3 scene (see the crate docs for the layout).
 
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
@@ -18,6 +18,18 @@ pub const DRAW_BYTES: usize = 32;
 /// Largest manifest a reader accepts (a manifest lists every sprite, so it can be large, but not
 /// unbounded).
 const MAX_MANIFEST: usize = 64 << 20;
+/// The version whose manifest and scene are deflated before they are encrypted.
+pub const ANIMATIONS_VERSION: u16 = 3;
+
+/// Raw DEFLATE (RFC 1951, no zlib or gzip header), as version 3 stores its manifest and scene.
+pub(crate) fn deflate(bytes: &[u8]) -> Vec<u8> {
+    miniz_oxide::deflate::compress_to_vec(bytes, 9)
+}
+
+/// Inflate a raw DEFLATE stream of at most `limit` bytes.
+pub(crate) fn inflate(bytes: &[u8], limit: usize) -> Result<Vec<u8>> {
+    miniz_oxide::inflate::decompress_to_vec_with_limit(bytes, limit).map_err(|_| Error::Format("a block could not be inflated".into()))
+}
 
 /// A 32-byte master key and whether it is the official key (flag bit 0 clear) or a custom one.
 #[derive(Clone, PartialEq, Eq)]
@@ -158,7 +170,10 @@ pub(crate) fn write_file(version: u16, key: &Key, nonces: &Nonces, blocks: &[Vec
         offset = offset.checked_add(len).ok_or_else(|| Error::Format("file too large".into()))?;
     }
     let manifest = place(&spans);
-    let manifest_bytes = serde_json::to_vec(&manifest).map_err(|e| Error::Format(e.to_string()))?;
+    let mut manifest_bytes = serde_json::to_vec(&manifest).map_err(|e| Error::Format(e.to_string()))?;
+    if version == ANIMATIONS_VERSION {
+        manifest_bytes = deflate(&manifest_bytes);
+    }
     let manifest_len = u32::try_from(manifest_bytes.len() + TAG_LEN).map_err(|_| Error::Format("manifest too large".into()))?;
     let head = header(version, key.custom, manifest_len, nonces);
     let bc = BlockCipher::new(&key.bytes, head)?;
@@ -187,7 +202,7 @@ pub fn read_header(file: &[u8]) -> Result<Header> {
     }
     let u16_at = |o: usize| h.get(o..o + 2).map(|b| u16::from_le_bytes([b[0], b[1]])).unwrap_or(0);
     let version = u16_at(8);
-    if version != 1 && version != 2 {
+    if !(1..=ANIMATIONS_VERSION).contains(&version) {
         return Err(Error::Format(format!("unsupported .wanim version {version}")));
     }
     let flags = u16_at(10);
@@ -198,7 +213,7 @@ pub fn read_header(file: &[u8]) -> Result<Header> {
     Ok(Header { version, custom_key: flags & FLAG_CUSTOM_KEY != 0, manifest_len })
 }
 
-/// A decrypted file: its manifest and every data block (atlases, then the timeline).
+/// A decrypted file: its manifest and every data block (atlases, then the timeline or scene).
 pub(crate) struct OpenedFile {
     pub header: Header,
     pub manifest: Value,
@@ -217,7 +232,10 @@ impl OpenedFile {
         head.copy_from_slice(file.get(..HEADER_LEN).ok_or_else(|| Error::Format("short header".into()))?);
         let bc = BlockCipher::new(key, head)?;
         let sealed = file.get(HEADER_LEN..HEADER_LEN + mlen).ok_or_else(|| Error::Format("manifest runs past the end of the file".into()))?;
-        let plain = bc.open(0, sealed)?;
+        let mut plain = bc.open(0, sealed)?;
+        if header.version == ANIMATIONS_VERSION {
+            plain = inflate(&plain, MAX_MANIFEST)?;
+        }
         let manifest: Value = serde_json::from_slice(&plain).map_err(|e| Error::Format(format!("manifest is not JSON: {e}")))?;
         Ok(OpenedFile { header, manifest, data_start: HEADER_LEN + mlen, bc })
     }
@@ -233,8 +251,8 @@ impl OpenedFile {
 }
 
 /// The manifest's `atlases` entry for a placed block.
-pub(crate) fn atlas_entry(span: (u64, u64), width: u32, height: u32) -> Value {
-    json!({"offset": span.0, "length": span.1, "width": width, "height": height, "format": "png"})
+pub(crate) fn atlas_entry(span: (u64, u64), width: u32, height: u32, format: crate::atlas::AtlasFormat) -> Value {
+    json!({"offset": span.0, "length": span.1, "width": width, "height": height, "format": format.name()})
 }
 
 /// Encode a version 2 timeline: `frameStart[frameCount + 1]`, then 32 bytes per draw.
@@ -283,4 +301,108 @@ pub(crate) fn decode_timeline(bytes: &[u8], frame_count: usize, draws: usize) ->
         Some(crate::Draw { sprite: u32_at(o)?, matrix: m, alpha: f32_at(o + 28)? })
     };
     starts.windows(2).map(|w| (w[0]..w[1]).map(draw_at).collect::<Option<Vec<_>>>().ok_or_else(bad)).collect()
+}
+
+/// The decoded scene of a version 3 file: every different draw once, every different frame once
+/// (a list of draws, back to front), and the list each frame shows.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Scene {
+    pub draws: Vec<crate::Draw>,
+    pub lists: Vec<Vec<u32>>,
+    pub frames: Vec<u32>,
+}
+
+/// Encode a version 3 scene: one column per draw field (`u32 sprite[D]`, then `a`, `b`, `c`, `d`,
+/// `tx`, `ty` and `alpha` as `f32[D]`), `u32 listStart[L + 1]`, `u32 items[I]`, `u32 frames[F]`.
+/// Returns the bytes and `I`.
+pub(crate) fn encode_scene(scene: &Scene) -> Result<(Vec<u8>, u32)> {
+    let many = || Error::TooLarge("too many draws".into());
+    let items: usize = scene.lists.iter().map(Vec::len).sum();
+    let item_count = u32::try_from(items).map_err(|_| many())?;
+    let mut out = Vec::with_capacity(scene.draws.len() * DRAW_BYTES + (scene.lists.len() + 1 + items + scene.frames.len()) * 4);
+    for d in &scene.draws {
+        out.extend_from_slice(&d.sprite.to_le_bytes());
+    }
+    for column in 0..6 {
+        for d in &scene.draws {
+            out.extend_from_slice(&d.matrix.get(column).copied().unwrap_or(0.0).to_le_bytes());
+        }
+    }
+    for d in &scene.draws {
+        out.extend_from_slice(&d.alpha.to_le_bytes());
+    }
+    let mut start = 0u32;
+    for l in &scene.lists {
+        out.extend_from_slice(&start.to_le_bytes());
+        start = u32::try_from(l.len()).ok().and_then(|n| start.checked_add(n)).ok_or_else(many)?;
+    }
+    out.extend_from_slice(&start.to_le_bytes());
+    for item in scene.lists.iter().flatten() {
+        out.extend_from_slice(&item.to_le_bytes());
+    }
+    for f in &scene.frames {
+        out.extend_from_slice(&f.to_le_bytes());
+    }
+    Ok((out, item_count))
+}
+
+/// The inflated size of a scene with `draws` draws, `lists` lists, `items` items and `frames`
+/// frames.
+pub(crate) fn scene_size(draws: usize, lists: usize, items: usize, frames: usize) -> Option<usize> {
+    let words = lists.checked_add(1)?.checked_add(items)?.checked_add(frames)?;
+    draws.checked_mul(DRAW_BYTES)?.checked_add(words.checked_mul(4)?)
+}
+
+/// Decode an inflated version 3 scene, checking its size, that every sprite, draw and list index
+/// exists (`sprites` is the number of sprites), that `listStart` starts at 0, never decreases and
+/// ends at `items`.
+pub(crate) fn decode_scene(bytes: &[u8], draws: usize, lists: usize, items: usize, frames: usize, sprites: usize) -> Result<Scene> {
+    let bad = || Error::Format("scene has the wrong size".into());
+    if scene_size(draws, lists, items, frames) != Some(bytes.len()) {
+        return Err(bad());
+    }
+    let u32_at = |o: usize| bytes.get(o..o + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+    let f32_at = |o: usize| bytes.get(o..o + 4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+    let column = |c: usize, i: usize| (c * draws + i) * 4;
+    let mut out = Scene::default();
+    for i in 0..draws {
+        let sprite = u32_at(column(0, i)).ok_or_else(bad)?;
+        if sprite as usize >= sprites {
+            return Err(Error::Format("a draw names a missing sprite".into()));
+        }
+        let mut matrix = [0f32; 6];
+        for (k, v) in matrix.iter_mut().enumerate() {
+            *v = f32_at(column(k + 1, i)).ok_or_else(bad)?;
+        }
+        out.draws.push(crate::Draw { sprite, matrix, alpha: f32_at(column(7, i)).ok_or_else(bad)? });
+    }
+    let lists_at = draws * DRAW_BYTES;
+    let items_at = lists_at + (lists + 1) * 4;
+    let frames_at = items_at + items * 4;
+    let starts: Vec<usize> = (0..=lists).map(|i| u32_at(lists_at + i * 4).map(|v| v as usize)).collect::<Option<_>>().ok_or_else(bad)?;
+    if starts.first() != Some(&0) || starts.windows(2).any(|w| w[1] < w[0]) || starts.last() != Some(&items) {
+        return Err(Error::Format("scene list starts are out of order".into()));
+    }
+    for w in starts.windows(2) {
+        let list: Vec<u32> = (w[0]..w[1]).map(|i| u32_at(items_at + i * 4)).collect::<Option<_>>().ok_or_else(bad)?;
+        if list.iter().any(|&d| d as usize >= draws) {
+            return Err(Error::Format("a list names a missing draw".into()));
+        }
+        out.lists.push(list);
+    }
+    out.frames = (0..frames).map(|i| u32_at(frames_at + i * 4)).collect::<Option<_>>().ok_or_else(bad)?;
+    if out.frames.iter().any(|&l| l as usize >= lists) {
+        return Err(Error::Format("a frame names a missing list".into()));
+    }
+    Ok(out)
+}
+
+/// The decrypted block 0 as stored (version 3: still deflated), for tests of the layout.
+#[cfg(test)]
+pub(crate) fn stored_manifest(file: &[u8], key: &[u8; 32]) -> Result<Vec<u8>> {
+    let header = read_header(file)?;
+    let mut head = [0u8; HEADER_LEN];
+    head.copy_from_slice(file.get(..HEADER_LEN).ok_or_else(|| Error::Format("short header".into()))?);
+    let sealed = file.get(HEADER_LEN..HEADER_LEN + header.manifest_len as usize).ok_or_else(|| Error::Format("short manifest".into()))?;
+    BlockCipher::new(key, head)?.open(0, sealed)
 }
