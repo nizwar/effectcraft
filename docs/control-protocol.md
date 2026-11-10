@@ -10,9 +10,10 @@ The port must be a number from 1 to 65535, and `--control` overrides the variabl
 unknown option prints an error and the app exits with status 1 before it opens a window.
 
 An app started with a control port is meant to be driven by an agent, so a normal launch does not
-wait for a person: the window opens without taking keyboard focus, and the app skips crash recovery,
-the Home screen (unless `--home` is given) and the startup update check. Help ▸ Check for Updates
-still works. One exception: when the window cannot start at all, the app writes the error to
+wait for a person: the window opens without taking keyboard focus, and the app skips crash recovery
+and the Home screen (unless `--home` is given). No launch checks for updates at start; Help ▸
+Check for Updates still works. One exception: when the window cannot start at all, the app writes
+the error to
 standard error and the session log and then shows it in a message box, and it exits only after
 someone closes that box.
 
